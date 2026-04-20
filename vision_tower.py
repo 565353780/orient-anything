@@ -1,18 +1,14 @@
 import torch
-from torch import nn
 import torch.nn.init as init
-import torch.nn.functional as F
 
-from utils.paths import *
-from typing import Dict, List, Optional, Set, Tuple, Union
-import os
+from torch import nn
 
-from contextlib import nullcontext
 from vggt.models.vggt import VGGT
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.layers import Mlp
 from vggt.layers.block import Block
-from vggt.heads.head_act import activate_pose
+
+from utils.paths import *
+
 
 class OriAny_CameraHead(nn.Module):
     """
@@ -190,18 +186,16 @@ class VGGT_OriAny_Ref(nn.Module):
         self.tgt_sampler.apply(init_weights)
 
     def forward(self, img_inputs):
-        device = self.get_device()
-
         with torch.amp.autocast(device_type='cuda', dtype=self.dtype):
             if img_inputs.shape == 4:
                 img_inputs = img_inputs[None]
             aggregated_tokens_list, ps_idx = self.vggt.aggregator(img_inputs)
-            
+
             # Predict Cameras
             # pose_enc = self.oriany_camera_head(aggregated_tokens_list)[-1]
             # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
             # extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
-            
+
             # Use tokens from the last block for camera prediction.
             tokens = aggregated_tokens_list[-1]
             # Extract the camera tokens
@@ -272,5 +266,3 @@ class MLP_dim(nn.Module):
 
     def forward(self, x):
         return self.net2(self.net1(x))
-
-
