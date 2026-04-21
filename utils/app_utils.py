@@ -1,9 +1,10 @@
 import rembg
-import random
 import torch
 import numpy as np
-from PIL import Image, ImageOps
+
+from PIL import Image
 from typing import Any
+
 
 def resize_foreground(
     image: Image,
