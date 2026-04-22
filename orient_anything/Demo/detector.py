@@ -76,7 +76,9 @@ def demo():
         drawAxesOnImage(src_image, single_result, fps_camera, image_save_path)
 
         axis_world = detector.detectAxisWorld(fps_camera)
-        axis_single = createAxisMesh(axis_world)
+        # `axes_world_from_ref_angles` 返回「列 = front/left/up」约定，而
+        # `createAxisMesh` 按「行 = 方向」解释输入，这里转置一次把列→行。
+        axis_single = createAxisMesh(axis_world.T)
 
         print('[INFO][Demo::demo] pair image inference')
         tgt_camera = fps_camera_list[(idx + 1) % len(fps_camera_list)]
@@ -121,8 +123,9 @@ def demo():
             tgt_camera,
         ).detach().cpu()
 
-        axis_src = createAxisMesh(axis_world_src)
-        axis_tgt = createAxisMesh(axis_world_tgt)
+        # 同上：列 = front/left/up → 行 = 方向。
+        axis_src = createAxisMesh(axis_world_src.T)
+        axis_tgt = createAxisMesh(axis_world_tgt.T)
 
         collection_mesh = o3d.geometry.TriangleMesh()
 
