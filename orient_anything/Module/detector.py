@@ -219,20 +219,14 @@ class Detector(object):
 
         ans_dict = inf_single_case(self.model, ref_image, tgt_image)
 
-        ref_az = self._extractScalar(ans_dict['ref_az_pred'])
-        ref_el = self._extractScalar(ans_dict['ref_el_pred'])
-        ref_ro = self._extractScalar(ans_dict['ref_ro_pred'])
-        ref_alpha = int(self._extractScalar(ans_dict['ref_alpha_pred']))
+        src_azi = self._extractScalar(ans_dict['ref_az_pred'])
+        src_ele = self._extractScalar(ans_dict['ref_el_pred'])
+        src_rot = self._extractScalar(ans_dict['ref_ro_pred'])
 
         result = {
-            'ref_az_pred': ref_az,
-            'ref_el_pred': ref_el,
-            'ref_ro_pred': ref_ro,
-            'ref_alpha_pred': ref_alpha,
-            'ref_azi': ref_az,
-            'ref_ele': ref_el,
-            'ref_rot': ref_ro,
-            'ref_alpha': ref_alpha,
+            'src_azi': src_azi,
+            'src_ele': src_ele,
+            'src_rot': src_rot,
         }
 
         if tgt_image is not None:
@@ -241,18 +235,11 @@ class Detector(object):
             rel_ro = self._extractScalar(ans_dict['rel_ro_pred'])
 
             tgt_azi_t, tgt_ele_t, tgt_rot_t = Get_target_azi_ele_rot(
-                ref_az, ref_el, ref_ro, rel_az, rel_el, rel_ro,
+                src_azi, src_ele, src_rot, rel_az, rel_el, rel_ro,
             )
-            tgt_azi = self._extractScalar(tgt_azi_t)
-            tgt_ele = self._extractScalar(tgt_ele_t)
-            tgt_rot = self._extractScalar(tgt_rot_t)
-
-            result['rel_az_pred'] = rel_az
-            result['rel_el_pred'] = rel_el
-            result['rel_ro_pred'] = rel_ro
-            result['tgt_azi'] = tgt_azi
-            result['tgt_ele'] = tgt_ele
-            result['tgt_rot'] = tgt_rot
+            result['tgt_azi'] = self._extractScalar(tgt_azi_t)
+            result['tgt_ele'] = self._extractScalar(tgt_ele_t)
+            result['tgt_rot'] = self._extractScalar(tgt_rot_t)
 
         return result
 
@@ -346,9 +333,9 @@ class Detector(object):
         result = self._runInference(ref_image, None, remove_background)
 
         axis_world = axes_world_from_ref_angles(
-            result['ref_az_pred'],
-            result['ref_el_pred'],
-            result['ref_ro_pred'],
+            result['src_azi'],
+            result['src_ele'],
+            result['src_rot'],
             camera,
         )
 
