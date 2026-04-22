@@ -4,6 +4,7 @@ sys.path.append('../camera-control')
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '7'
 
+import cv2
 import open3d as o3d
 
 from camera_control.Method.mesh import createAxisMesh
@@ -33,7 +34,63 @@ def _printTgtAngles(result):
     return
 
 
-def demo():
+def demo_single_image():
+    home = os.environ['HOME']
+    model_file_path = f'{home}/chLi/Model/OA2/rotmod_realrotaug_best.pt'
+    device = 'cuda:0'
+    dtype = 'auto'
+    output_folder_path = './output/demo_detector/'
+
+    image_file_path = ''
+
+    detector = Detector(
+        model_file_path=model_file_path,
+        device=device,
+        dtype=dtype,
+    )
+
+    assert detector.is_valid
+
+    src_image = cv2.imread(image_file_path)
+
+    single_result = detector.detect(src_image)
+
+    assert single_result is not None
+    _printSrcAngles(single_result)
+    return True
+
+def demo_single_camera():
+    home = os.environ['HOME']
+    model_file_path = f'{home}/chLi/Model/OA2/rotmod_realrotaug_best.pt'
+    colmap_data_folder_path = f'{home}/chLi/Dataset/GS/haizei_1_v4/gs/'
+    device = 'cuda:0'
+    dtype = 'auto'
+    output_folder_path = './output/demo_detector/'
+
+    camera_list = CameraConvertor.loadColmapDataFolder(colmap_data_folder_path)
+
+    detector = Detector(
+        model_file_path=model_file_path,
+        device=device,
+        dtype=dtype,
+    )
+
+    assert detector.is_valid
+
+    src_image = camera_list[0].toImage()
+
+    single_result = detector.detect(src_image)
+
+    assert single_result is not None
+    _printSrcAngles(single_result)
+
+    image_save_path = os.path.join(
+        output_folder_path, f'single_camera', 'axis_overlay.png'
+    )
+    drawAxesOnImage(src_image, single_result, camera_list[0], image_save_path)
+    return True
+
+def demo_camera_pair():
     home = os.environ['HOME']
     model_file_path = f'{home}/chLi/Model/OA2/rotmod_realrotaug_best.pt'
     colmap_data_folder_path = f'{home}/chLi/Dataset/GS/haizei_1_v4/gs/'
@@ -56,77 +113,100 @@ def demo():
 
     assert detector.is_valid
 
-    for idx, fps_camera in enumerate(fps_camera_list):
-        src_image = fps_camera.toImage()
+    src_camera = camera_list[0]
+    src_image = camera_list[0].toImage()
 
-        single_result = detector.detect(src_image)
+    axis_world = detector.detectAxisWorld(camera_list[0])
+    axis_single = createAxisMesh(axis_world)
 
-        assert single_result is not None
-        _printSrcAngles(single_result)
+    print('[INFO][Demo::demo] pair image inference')
+    tgt_camera = fps_camera_list[1]
+    tgt_image = tgt_camera.toImage()
+    pair_result = detector.detectPair(
+        src_image,
+        tgt_image,
+    )
+    _printSrcAngles(pair_result)
+    _printTgtAngles(pair_result)
 
-        image_save_path = os.path.join(
-            output_folder_path, f'camera_{idx:03d}', 'axis_overlay.png'
-        )
-        drawAxesOnImage(src_image, single_result, fps_camera, image_save_path)
+    pair_dir = os.path.join(output_folder_path, f'camera_pair')
+    pair_src_overlay = os.path.join(pair_dir, 'pair_axis_src_overlay.png')
+    pair_tgt_overlay = os.path.join(pair_dir, 'pair_axis_tgt_overlay.png')
+    pair_concat_path = os.path.join(pair_dir, 'pair_axis_concat.png')
+    drawAxesOnImage(src_image, pair_result, src_camera, pair_src_overlay)
+    tgt_result_for_draw = {
+        'src_azi': float(pair_result['tgt_azi']),
+        'src_ele': float(pair_result['tgt_ele']),
+        'src_rot': float(pair_result['tgt_rot']),
+    }
+    drawAxesOnImage(tgt_image, tgt_result_for_draw, tgt_camera, pair_tgt_overlay)
+    concat_rgb = concatHorizontal(
+        loadImageRGB(pair_src_overlay),
+        loadImageRGB(pair_tgt_overlay),
+    )
+    saveImageRGB(concat_rgb, pair_concat_path)
+    print(
+        f'[INFO][Demo::demo] saved pair axis concat image to: {pair_concat_path}'
+    )
 
-        axis_world = detector.detectAxisWorld(fps_camera)
-        axis_single = createAxisMesh(axis_world)
+    src_axis_world, tgt_axis_world = detector.detectAxisPairWorld(
+        src_camera,
+        tgt_camera,
+    )
+    print(src_axis_world)
+    print(tgt_axis_world)
 
-        print('[INFO][Demo::demo] pair image inference')
-        tgt_camera = fps_camera_list[(idx + 1) % len(fps_camera_list)]
-        tgt_image = tgt_camera.toImage()
-        pair_result = detector.detectPair(
-            src_image,
-            tgt_image,
-        )
-        _printSrcAngles(pair_result)
-        _printTgtAngles(pair_result)
+    # 同上：列 = front/left/up → 行 = 方向。
+    axis_src = createAxisMesh(src_axis_world)
+    axis_tgt = createAxisMesh(tgt_axis_world)
 
-        pair_dir = os.path.join(output_folder_path, f'camera_{idx:03d}')
-        pair_src_overlay = os.path.join(pair_dir, 'pair_axis_src_overlay.png')
-        pair_tgt_overlay = os.path.join(pair_dir, 'pair_axis_tgt_overlay.png')
-        pair_concat_path = os.path.join(pair_dir, 'pair_axis_concat.png')
-        drawAxesOnImage(src_image, pair_result, fps_camera, pair_src_overlay)
-        tgt_result_for_draw = {
-            'src_azi': float(pair_result['tgt_azi']),
-            'src_ele': float(pair_result['tgt_ele']),
-            'src_rot': float(pair_result['tgt_rot']),
-        }
-        drawAxesOnImage(tgt_image, tgt_result_for_draw, tgt_camera, pair_tgt_overlay)
-        concat_rgb = concatHorizontal(
-            loadImageRGB(pair_src_overlay),
-            loadImageRGB(pair_tgt_overlay),
-        )
-        saveImageRGB(concat_rgb, pair_concat_path)
-        print(
-            f'[INFO][Demo::demo] saved pair axis concat image to: {pair_concat_path}'
-        )
+    collection_mesh = o3d.geometry.TriangleMesh()
 
-        src_axis_world, tgt_axis_world = detector.detectAxisPairWorld(
-            fps_camera,
-            tgt_camera,
-        )
-        print(src_axis_world)
-        print(tgt_axis_world)
+    collection_mesh += src_camera.toO3DMesh()
+    collection_mesh += tgt_camera.toO3DMesh()
 
-        # 同上：列 = front/left/up → 行 = 方向。
-        axis_src = createAxisMesh(src_axis_world)
-        axis_tgt = createAxisMesh(tgt_axis_world)
+    collection_mesh += axis_single
 
-        collection_mesh = o3d.geometry.TriangleMesh()
+    axis_src.translate([-2, 0, 0])
+    axis_tgt.translate([2, 0, 0])
+    collection_mesh += axis_src
+    collection_mesh += axis_tgt
+    collection_mesh += src_camera.toO3DAxisMesh()
+    collection_mesh += tgt_camera.toO3DAxisMesh()
 
-        collection_mesh += fps_camera.toO3DMesh()
-        collection_mesh += tgt_camera.toO3DMesh()
+    o3d.io.write_triangle_mesh(pair_dir + '/collection.ply', collection_mesh)
+    return True
 
-        collection_mesh += axis_single
+def demo_camera_list():
+    home = os.environ['HOME']
+    model_file_path = f'{home}/chLi/Model/OA2/rotmod_realrotaug_best.pt'
+    colmap_data_folder_path = f'{home}/chLi/Dataset/GS/haizei_1_v4/gs/'
+    device = 'cuda:0'
+    dtype = 'auto'
+    output_folder_path = './output/demo_detector/'
 
-        axis_src.translate([-2, 0, 0])
-        axis_tgt.translate([2, 0, 0])
-        collection_mesh += axis_src
-        collection_mesh += axis_tgt
-        collection_mesh += fps_camera.toO3DAxisMesh()
-        collection_mesh += tgt_camera.toO3DAxisMesh()
+    camera_list = CameraConvertor.loadColmapDataFolder(colmap_data_folder_path)
 
-        o3d.io.write_triangle_mesh(pair_dir + '/collection.ply', collection_mesh)
+    detector = Detector(
+        model_file_path=model_file_path,
+        device=device,
+        dtype=dtype,
+    )
+
+    assert detector.is_valid
+
+    best_axis_world = detector.detectBestAxisWorld(camera_list)
+
+    axis = createAxisMesh(best_axis_world)
+
+    collection_mesh = o3d.geometry.TriangleMesh()
+
+    for camera in camera_list:
+        collection_mesh += camera.toO3DMesh()
+        collection_mesh += camera.toO3DAxisMesh()
+
+    collection_mesh += axis
+
+    o3d.io.write_triangle_mesh(output_folder_path + 'best_axis_world.ply', collection_mesh)
 
     return True

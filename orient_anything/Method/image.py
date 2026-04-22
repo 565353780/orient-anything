@@ -6,10 +6,9 @@ cv2 的 BGR 约定，也不再引用 PIL。
 """
 
 import os
-
 import cv2
-import numpy as np
 import torch
+import numpy as np
 
 
 def toRGBUint8(image) -> np.ndarray:

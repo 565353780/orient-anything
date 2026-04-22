@@ -2,6 +2,7 @@ import os
 import torch
 import numpy as np
 
+from tqdm import trange
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from camera_control.Module.camera import Camera
@@ -97,14 +98,6 @@ class Detector(object):
         return True
 
     @staticmethod
-    def _toRGBUint8(image: Any) -> np.ndarray:
-        return toRGBUint8(image)
-
-    @staticmethod
-    def _loadImageFile(image_file_path: str) -> np.ndarray:
-        return loadImageRGB(image_file_path)
-
-    @staticmethod
     def _extractScalar(value: Any) -> float:
         if isinstance(value, torch.Tensor):
             return float(value.detach().cpu().reshape(-1)[0].item())
@@ -165,7 +158,7 @@ class Detector(object):
         if not self._ensureValid():
             return None
 
-        ref_image_rgb = self._toRGBUint8(image)
+        ref_image_rgb = toRGBUint8(image)
         return self._runInference(ref_image_rgb)
 
     @torch.no_grad()
@@ -182,7 +175,7 @@ class Detector(object):
         if not self._ensureValid():
             return None
 
-        ref_image_rgb = self._loadImageFile(image_file_path)
+        ref_image_rgb = loadImageRGB(image_file_path)
         return self._runInference(ref_image_rgb)
 
     @torch.no_grad()
@@ -194,8 +187,8 @@ class Detector(object):
         if not self._ensureValid():
             return None
 
-        ref_rgb = self._toRGBUint8(ref_image)
-        tgt_rgb = self._toRGBUint8(tgt_image)
+        ref_rgb = toRGBUint8(ref_image)
+        tgt_rgb = toRGBUint8(tgt_image)
         return self._runInference(ref_rgb, tgt_rgb)
 
     @torch.no_grad()
@@ -219,8 +212,8 @@ class Detector(object):
         if not self._ensureValid():
             return None
 
-        ref_rgb = self._loadImageFile(ref_image_file_path)
-        tgt_rgb = self._loadImageFile(tgt_image_file_path)
+        ref_rgb = loadImageRGB(ref_image_file_path)
+        tgt_rgb = loadImageRGB(tgt_image_file_path)
         return self._runInference(ref_rgb, tgt_rgb)
 
     @torch.no_grad()
@@ -238,7 +231,7 @@ class Detector(object):
             mask_smaller_pixel_num=mask_smaller_pixel_num,
         )
 
-        ref_image_rgb = self._toRGBUint8(image)
+        ref_image_rgb = toRGBUint8(image)
         result = self._runInference(ref_image_rgb)
 
         axis_world = axes_world_from_ref_angles(
@@ -270,8 +263,8 @@ class Detector(object):
             mask_smaller_pixel_num=mask_smaller_pixel_num,
         )
 
-        src_rgb = self._toRGBUint8(src_image)
-        tgt_rgb = self._toRGBUint8(tgt_image)
+        src_rgb = toRGBUint8(src_image)
+        tgt_rgb = toRGBUint8(tgt_image)
         result = self._runInference(src_rgb, tgt_rgb)
 
         src_axis_world = axes_world_from_ref_angles(
