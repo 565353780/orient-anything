@@ -12,14 +12,16 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '7'
 
 import open3d as o3d
 
-from PIL import Image
-
 from camera_control.Method.mesh import createAxisMesh
 from camera_control.Module.camera_convertor import CameraConvertor
 from camera_control.Module.camera_filter import CameraFilter
 
 from orient_anything.Method.axis import axes_world_from_ref_angles
-from orient_anything.Method.image import concatPilHorizontal
+from orient_anything.Method.image import (
+    concatHorizontal,
+    loadImageRGB,
+    saveImageRGB,
+)
 from orient_anything.Method.render import drawAxesOnImage
 from orient_anything.Module.detector import Detector
 
@@ -97,12 +99,11 @@ def demo():
             'src_rot': float(pair_result['tgt_rot']),
         }
         drawAxesOnImage(tgt_image, tgt_result_for_draw, tgt_camera, pair_tgt_overlay)
-        pil_concat = concatPilHorizontal(
-            Image.open(pair_src_overlay),
-            Image.open(pair_tgt_overlay),
+        concat_rgb = concatHorizontal(
+            loadImageRGB(pair_src_overlay),
+            loadImageRGB(pair_tgt_overlay),
         )
-        os.makedirs(pair_dir, exist_ok=True)
-        pil_concat.save(pair_concat_path)
+        saveImageRGB(concat_rgb, pair_concat_path)
         print(
             f'[INFO][Demo::demo] saved pair axis concat image to: {pair_concat_path}'
         )
@@ -140,3 +141,7 @@ def demo():
         o3d.io.write_triangle_mesh(pair_dir + '/collection.ply', collection_mesh)
 
     return True
+
+
+if __name__ == '__main__':
+    demo()

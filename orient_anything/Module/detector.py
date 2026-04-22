@@ -1,10 +1,9 @@
 import os
 import sys
 
-import torch
 import numpy as np
+import torch
 
-from PIL import Image
 from typing import Any, Dict, Optional, Union
 
 from camera_control.Module.camera import Camera
@@ -25,6 +24,7 @@ from orient_anything.Method.axis import (
     axes_camera_from_ref_angles,
     axes_world_from_ref_angles,
 )
+from orient_anything.Method.image import loadImageRGB, toRGBUint8
 
 
 # 对外保留以下两个符号（axes_camera_from_ref_angles / axes_world_from_ref_angles），
@@ -45,6 +45,20 @@ def _auto_dtype() -> torch.dtype:
             pass
         return torch.float16
     return torch.float32
+
+
+def _npToPilForModel(image_rgb_uint8: np.ndarray):
+    """**唯一残留的 PIL 桥接点**：把 RGB uint8 ``numpy.ndarray`` 转为 ``PIL.Image``。
+
+    ``utils/app_utils.py`` 中的 ``background_preprocess`` / ``inf_single_case``
+    （以及它内部的 ``preprocess_images``）是第三方模型侧的预处理，内部强依赖
+    PIL（``img.mode`` / ``img.size`` / ``img.convert`` / ``img.resize`` 等）。
+    为避免改动模型输入分布，这里保留一个局部、单向的 numpy → PIL 转换，
+    业务代码 (``Method/*`` / ``Demo/*``) 全部只跟 numpy + cv2 打交道。
+    """
+    from PIL import Image
+
+    return Image.fromarray(image_rgb_uint8)
 
 
 class Detector(object):
@@ -103,36 +117,12 @@ class Detector(object):
         return True
 
     @staticmethod
-    def _toPilImage(image: Any) -> Image.Image:
-        if isinstance(image, Image.Image):
-            return image.convert('RGB')
-
-        if isinstance(image, np.ndarray):
-            array = image
-        elif isinstance(image, torch.Tensor):
-            array = image.detach().cpu()
-            if array.dtype.is_floating_point:
-                array = array.clamp(0.0, 1.0) * 255.0
-            array = array.to(torch.uint8).numpy()
-            if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
-                array = np.transpose(array, (1, 2, 0))
-        else:
-            raise TypeError(
-                f"Unsupported image type: {type(image)}. "
-                f"Expected PIL.Image.Image, numpy.ndarray or torch.Tensor."
-            )
-
-        if array.ndim == 2:
-            array = np.stack([array] * 3, axis=-1)
-
-        if array.dtype != np.uint8:
-            array = np.clip(array, 0, 255).astype(np.uint8)
-
-        return Image.fromarray(array).convert('RGB')
+    def _toRGBUint8(image: Any) -> np.ndarray:
+        return toRGBUint8(image)
 
     @staticmethod
-    def _loadImageFile(image_file_path: str) -> Image.Image:
-        return Image.open(image_file_path).convert('RGB')
+    def _loadImageFile(image_file_path: str) -> np.ndarray:
+        return loadImageRGB(image_file_path)
 
     @staticmethod
     def _extractScalar(value: Any) -> float:
@@ -151,16 +141,23 @@ class Detector(object):
 
     def _runInference(
         self,
-        ref_image: Image.Image,
-        tgt_image: Optional[Image.Image],
+        ref_image_rgb: np.ndarray,
+        tgt_image_rgb: Optional[np.ndarray],
         remove_background: bool,
     ) -> Dict[str, float]:
-        if remove_background:
-            ref_image = background_preprocess(ref_image, True)
-            if tgt_image is not None:
-                tgt_image = background_preprocess(tgt_image, True)
+        # 模型侧 (utils/app_utils.preprocess_images) 要求 PIL 输入，这里做唯一一次
+        # numpy → PIL 的局部转换，尽量靠近调用点以便后续模型预处理被完全替换后可直接删除。
+        ref_for_model = _npToPilForModel(ref_image_rgb)
+        tgt_for_model = (
+            _npToPilForModel(tgt_image_rgb) if tgt_image_rgb is not None else None
+        )
 
-        ans_dict = inf_single_case(self.model, ref_image, tgt_image)
+        if remove_background:
+            ref_for_model = background_preprocess(ref_for_model, True)
+            if tgt_for_model is not None:
+                tgt_for_model = background_preprocess(tgt_for_model, True)
+
+        ans_dict = inf_single_case(self.model, ref_for_model, tgt_for_model)
 
         src_azi = self._extractScalar(ans_dict['ref_az_pred'])
         src_ele = self._extractScalar(ans_dict['ref_el_pred'])
@@ -172,7 +169,7 @@ class Detector(object):
             'src_rot': src_rot,
         }
 
-        if tgt_image is not None:
+        if tgt_image_rgb is not None:
             rel_az = self._extractScalar(ans_dict['rel_az_pred'])
             rel_el = self._extractScalar(ans_dict['rel_el_pred'])
             rel_ro = self._extractScalar(ans_dict['rel_ro_pred'])
@@ -189,14 +186,14 @@ class Detector(object):
     @torch.no_grad()
     def detect(
         self,
-        image_tensor: Any,
+        image: Any,
         remove_background: bool = False,
     ) -> Union[Dict[str, float], None]:
         if not self._ensureValid():
             return None
 
-        ref_image = self._toPilImage(image_tensor)
-        return self._runInference(ref_image, None, remove_background)
+        ref_image_rgb = self._toRGBUint8(image)
+        return self._runInference(ref_image_rgb, None, remove_background)
 
     @torch.no_grad()
     def detectFile(
@@ -213,8 +210,8 @@ class Detector(object):
         if not self._ensureValid():
             return None
 
-        ref_image = self._loadImageFile(image_file_path)
-        return self._runInference(ref_image, None, remove_background)
+        ref_image_rgb = self._loadImageFile(image_file_path)
+        return self._runInference(ref_image_rgb, None, remove_background)
 
     @torch.no_grad()
     def detectPair(
@@ -226,9 +223,9 @@ class Detector(object):
         if not self._ensureValid():
             return None
 
-        pil_ref = self._toPilImage(ref_image)
-        pil_tgt = self._toPilImage(tgt_image)
-        return self._runInference(pil_ref, pil_tgt, remove_background)
+        ref_rgb = self._toRGBUint8(ref_image)
+        tgt_rgb = self._toRGBUint8(tgt_image)
+        return self._runInference(ref_rgb, tgt_rgb, remove_background)
 
     @torch.no_grad()
     def detectPairFiles(
@@ -252,9 +249,9 @@ class Detector(object):
         if not self._ensureValid():
             return None
 
-        pil_ref = self._loadImageFile(ref_image_file_path)
-        pil_tgt = self._loadImageFile(tgt_image_file_path)
-        return self._runInference(pil_ref, pil_tgt, remove_background)
+        ref_rgb = self._loadImageFile(ref_image_file_path)
+        tgt_rgb = self._loadImageFile(tgt_image_file_path)
+        return self._runInference(ref_rgb, tgt_rgb, remove_background)
 
     @torch.no_grad()
     def detectAxisWorld(
@@ -272,8 +269,8 @@ class Detector(object):
             mask_smaller_pixel_num=mask_smaller_pixel_num,
         )
 
-        ref_image = self._toPilImage(image)
-        result = self._runInference(ref_image, None, remove_background)
+        ref_image_rgb = self._toRGBUint8(image)
+        result = self._runInference(ref_image_rgb, None, remove_background)
 
         axis_world = axes_world_from_ref_angles(
             result['src_azi'],
