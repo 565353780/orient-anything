@@ -4,7 +4,7 @@ import sys
 import numpy as np
 import torch
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from camera_control.Module.camera import Camera
 
@@ -279,4 +279,44 @@ class Detector(object):
             camera,
         )
 
-        return axis_world.detach().cpu()
+        return axis_world.T
+
+    @torch.no_grad()
+    def detectAxisPairWorld(
+        self,
+        src_camera: Camera,
+        tgt_camera: Camera,
+        use_mask: bool = True,
+        mask_smaller_pixel_num: int = 0,
+        remove_background: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[None, None]]:
+        if not self._ensureValid():
+            return None, None
+
+        src_image = src_camera.toImage(
+            use_mask=use_mask,
+            mask_smaller_pixel_num=mask_smaller_pixel_num,
+        )
+        tgt_image = tgt_camera.toImage(
+            use_mask=use_mask,
+            mask_smaller_pixel_num=mask_smaller_pixel_num,
+        )
+
+        src_rgb = self._toRGBUint8(src_image)
+        tgt_rgb = self._toRGBUint8(tgt_image)
+        result = self._runInference(src_rgb, tgt_rgb, remove_background)
+
+        src_axis_world = axes_world_from_ref_angles(
+            result['src_azi'],
+            result['src_ele'],
+            result['src_rot'],
+            src_camera,
+        )
+        tgt_axis_world = axes_world_from_ref_angles(
+            result['tgt_azi'],
+            result['tgt_ele'],
+            result['tgt_rot'],
+            tgt_camera,
+        )
+
+        return src_axis_world.T, tgt_axis_world.T

@@ -1,13 +1,7 @@
 import sys
-import os
-
-CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
-ORIENT_ANYTHING_ROOT = os.path.abspath(os.path.join(CURRENT_FILE_DIR, '..', '..'))
-if ORIENT_ANYTHING_ROOT not in sys.path:
-    sys.path.insert(0, ORIENT_ANYTHING_ROOT)
-
 sys.path.append('../camera-control')
 
+import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '7'
 
 import open3d as o3d
@@ -16,7 +10,6 @@ from camera_control.Method.mesh import createAxisMesh
 from camera_control.Module.camera_convertor import CameraConvertor
 from camera_control.Module.camera_filter import CameraFilter
 
-from orient_anything.Method.axis import axes_world_from_ref_angles
 from orient_anything.Method.image import (
     concatHorizontal,
     loadImageRGB,
@@ -46,9 +39,7 @@ def demo():
     colmap_data_folder_path = f'{home}/chLi/Dataset/GS/haizei_1_v4/gs/'
     device = 'cuda:0'
     dtype = 'auto'
-    output_folder_path = os.path.abspath(
-        os.path.join(CURRENT_FILE_DIR, '..', '..', 'output', 'demo_detector')
-    )
+    output_folder_path = './output/demo_detector/'
 
     camera_list = CameraConvertor.loadColmapDataFolder(colmap_data_folder_path)
 
@@ -66,8 +57,11 @@ def demo():
     assert detector.is_valid
 
     for idx, fps_camera in enumerate(fps_camera_list):
-        src_image = fps_camera.toImage(use_mask=True, mask_smaller_pixel_num=0)
+        src_image = fps_camera.toImage()
+
         single_result = detector.detect(src_image)
+
+        assert single_result is not None
         _printSrcAngles(single_result)
 
         image_save_path = os.path.join(
@@ -76,13 +70,11 @@ def demo():
         drawAxesOnImage(src_image, single_result, fps_camera, image_save_path)
 
         axis_world = detector.detectAxisWorld(fps_camera)
-        # `axes_world_from_ref_angles` 返回「列 = front/left/up」约定，而
-        # `createAxisMesh` 按「行 = 方向」解释输入，这里转置一次把列→行。
-        axis_single = createAxisMesh(axis_world.T)
+        axis_single = createAxisMesh(axis_world)
 
         print('[INFO][Demo::demo] pair image inference')
         tgt_camera = fps_camera_list[(idx + 1) % len(fps_camera_list)]
-        tgt_image = tgt_camera.toImage(use_mask=True, mask_smaller_pixel_num=0)
+        tgt_image = tgt_camera.toImage()
         pair_result = detector.detectPair(
             src_image,
             tgt_image,
@@ -110,22 +102,16 @@ def demo():
             f'[INFO][Demo::demo] saved pair axis concat image to: {pair_concat_path}'
         )
 
-        axis_world_src = axes_world_from_ref_angles(
-            pair_result['src_azi'],
-            pair_result['src_ele'],
-            pair_result['src_rot'],
+        src_axis_world, tgt_axis_world = detector.detectAxisPairWorld(
             fps_camera,
-        ).detach().cpu()
-        axis_world_tgt = axes_world_from_ref_angles(
-            tgt_result_for_draw['src_azi'],
-            tgt_result_for_draw['src_ele'],
-            tgt_result_for_draw['src_rot'],
             tgt_camera,
-        ).detach().cpu()
+        )
+        print(src_axis_world)
+        print(tgt_axis_world)
 
         # 同上：列 = front/left/up → 行 = 方向。
-        axis_src = createAxisMesh(axis_world_src.T)
-        axis_tgt = createAxisMesh(axis_world_tgt.T)
+        axis_src = createAxisMesh(src_axis_world)
+        axis_tgt = createAxisMesh(tgt_axis_world)
 
         collection_mesh = o3d.geometry.TriangleMesh()
 
@@ -144,7 +130,3 @@ def demo():
         o3d.io.write_triangle_mesh(pair_dir + '/collection.ply', collection_mesh)
 
     return True
-
-
-if __name__ == '__main__':
-    demo()
