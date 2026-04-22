@@ -2,11 +2,18 @@
 
 渲染链路复用 `orient_anything.Demo.detector` 中的内部渲染函数：
 
-    az/el/ro  ──► _axis_world_from_ref_angles  ──►  3x3 axis_world (front/left/up)
-              ──► _saveAxisWorldMeshes         ──►  合并后的 .ply (R/G/B 三色箭头)
+    az/el/ro  ──► _axis_cam_from_ref_angles  ──►  3x3 axis_cam (front/left/up)
+              ──► _saveAxisWorldMeshes       ──►  合并后的 .ply (R/G/B 三色箭头)
 
 与 Blender 路径 (`utils.axis_renderer.BlendRenderer`) 不同，这里仅依赖
 `azi_ele_rot_to_semantic_axes` + Open3D 箭头网格，无需 `bpy`/`.blend` 资源。
+
+注意：网络预测的 `(az, el, ro)` 本身是物体在 **相机坐标系** 下的 ZYX 欧拉角，
+所以这里使用的是 `_axis_cam_from_ref_angles` 取相机系三轴；导出 `.ply` 相当
+于把该相机系可视化到文件。当相机处于「位于 +X 轴正半轴、朝向 -X、Y/Z 分别
+朝右/朝上」的 canonical 位姿时，camera-frame 与肉眼在 Blender 里观察到的
+Blender-world 朝向一一对应；其他相机下需通过 `_axis_world_from_ref_angles`
+搭配真实的 `camera.camera2world` 才能得到世界系三轴。
 
 覆盖 7 种非空组合（`2^3 - 1 = 7`）：
   - 单轴：azi / ele / rot 各自为 45°；
@@ -36,7 +43,7 @@ if CURRENT_FILE_DIR not in sys.path:
     sys.path.insert(0, CURRENT_FILE_DIR)
 
 from orient_anything.Demo.detector import (  # noqa: E402
-    _axis_world_from_ref_angles,
+    _axis_cam_from_ref_angles,
     _saveAxisWorldMeshes,
 )
 
@@ -74,12 +81,12 @@ def test_render_axis_cases() -> None:
             f'(azi={az}, ele={el}, rot={ro})'
         )
 
-        axis_world = _axis_world_from_ref_angles(az, el, ro)
-        print('\t axis_world (front|left|up):')
-        print(axis_world)
+        axis_cam = _axis_cam_from_ref_angles(az, el, ro)
+        print('\t axis_cam (front|left|up):')
+        print(axis_cam)
 
         saved_paths = _saveAxisWorldMeshes(
-            axis_world,
+            axis_cam,
             OUTPUT_DIR,
             prefix=prefix,
         )
