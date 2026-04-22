@@ -1,39 +1,19 @@
 import os
-import sys
-
-import numpy as np
 import torch
+import numpy as np
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from camera_control.Module.camera import Camera
-
-CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.abspath(os.path.join(CURRENT_FILE_DIR, '..', '..'))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
 
 from vision_tower import VGGT_OriAny_Ref
 from utils.app_utils import (
     Get_target_azi_ele_rot,
-    background_preprocess,
     inf_single_case,
 )
 
-from orient_anything.Method.axis import (
-    axes_camera_from_ref_angles,
-    axes_world_from_ref_angles,
-)
+from orient_anything.Method.axis import axes_world_from_ref_angles
 from orient_anything.Method.image import loadImageRGB, toRGBUint8
-
-
-# 对外保留以下两个符号（axes_camera_from_ref_angles / axes_world_from_ref_angles），
-# 以便 `from orient_anything.Module.detector import ...` 的历史调用继续可用。
-__all__ = [
-    'Detector',
-    'axes_camera_from_ref_angles',
-    'axes_world_from_ref_angles',
-]
 
 
 def _auto_dtype() -> torch.dtype:
@@ -142,8 +122,7 @@ class Detector(object):
     def _runInference(
         self,
         ref_image_rgb: np.ndarray,
-        tgt_image_rgb: Optional[np.ndarray],
-        remove_background: bool,
+        tgt_image_rgb: Optional[np.ndarray]=None,
     ) -> Dict[str, float]:
         # 模型侧 (utils/app_utils.preprocess_images) 要求 PIL 输入，这里做唯一一次
         # numpy → PIL 的局部转换，尽量靠近调用点以便后续模型预处理被完全替换后可直接删除。
@@ -151,11 +130,6 @@ class Detector(object):
         tgt_for_model = (
             _npToPilForModel(tgt_image_rgb) if tgt_image_rgb is not None else None
         )
-
-        if remove_background:
-            ref_for_model = background_preprocess(ref_for_model, True)
-            if tgt_for_model is not None:
-                tgt_for_model = background_preprocess(tgt_for_model, True)
 
         ans_dict = inf_single_case(self.model, ref_for_model, tgt_for_model)
 
@@ -187,19 +161,17 @@ class Detector(object):
     def detect(
         self,
         image: Any,
-        remove_background: bool = False,
     ) -> Union[Dict[str, float], None]:
         if not self._ensureValid():
             return None
 
         ref_image_rgb = self._toRGBUint8(image)
-        return self._runInference(ref_image_rgb, None, remove_background)
+        return self._runInference(ref_image_rgb)
 
     @torch.no_grad()
     def detectFile(
         self,
         image_file_path: str,
-        remove_background: bool = False,
     ) -> Union[Dict[str, float], None]:
         if not os.path.exists(image_file_path):
             print('[ERROR][Detector::detectFile]')
@@ -211,28 +183,26 @@ class Detector(object):
             return None
 
         ref_image_rgb = self._loadImageFile(image_file_path)
-        return self._runInference(ref_image_rgb, None, remove_background)
+        return self._runInference(ref_image_rgb)
 
     @torch.no_grad()
     def detectPair(
         self,
         ref_image: Any,
         tgt_image: Any,
-        remove_background: bool = False,
     ) -> Union[Dict[str, float], None]:
         if not self._ensureValid():
             return None
 
         ref_rgb = self._toRGBUint8(ref_image)
         tgt_rgb = self._toRGBUint8(tgt_image)
-        return self._runInference(ref_rgb, tgt_rgb, remove_background)
+        return self._runInference(ref_rgb, tgt_rgb)
 
     @torch.no_grad()
     def detectPairFiles(
         self,
         ref_image_file_path: str,
         tgt_image_file_path: str,
-        remove_background: bool = False,
     ) -> Union[Dict[str, float], None]:
         if not os.path.exists(ref_image_file_path):
             print('[ERROR][Detector::detectPairFiles]')
@@ -251,7 +221,7 @@ class Detector(object):
 
         ref_rgb = self._loadImageFile(ref_image_file_path)
         tgt_rgb = self._loadImageFile(tgt_image_file_path)
-        return self._runInference(ref_rgb, tgt_rgb, remove_background)
+        return self._runInference(ref_rgb, tgt_rgb)
 
     @torch.no_grad()
     def detectAxisWorld(
@@ -259,7 +229,6 @@ class Detector(object):
         camera: Camera,
         use_mask: bool = True,
         mask_smaller_pixel_num: int = 0,
-        remove_background: bool = False,
     ) -> Union[torch.Tensor, None]:
         if not self._ensureValid():
             return None
@@ -270,7 +239,7 @@ class Detector(object):
         )
 
         ref_image_rgb = self._toRGBUint8(image)
-        result = self._runInference(ref_image_rgb, None, remove_background)
+        result = self._runInference(ref_image_rgb)
 
         axis_world = axes_world_from_ref_angles(
             result['src_azi'],
@@ -288,7 +257,6 @@ class Detector(object):
         tgt_camera: Camera,
         use_mask: bool = True,
         mask_smaller_pixel_num: int = 0,
-        remove_background: bool = False,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[None, None]]:
         if not self._ensureValid():
             return None, None
@@ -304,7 +272,7 @@ class Detector(object):
 
         src_rgb = self._toRGBUint8(src_image)
         tgt_rgb = self._toRGBUint8(tgt_image)
-        result = self._runInference(src_rgb, tgt_rgb, remove_background)
+        result = self._runInference(src_rgb, tgt_rgb)
 
         src_axis_world = axes_world_from_ref_angles(
             result['src_azi'],
@@ -320,3 +288,47 @@ class Detector(object):
         )
 
         return src_axis_world.T, tgt_axis_world.T
+
+    @torch.no_grad()
+    def detectBestAxisWorld(
+        self,
+        camera_list: List[Camera],
+        use_mask: bool = True,
+        mask_smaller_pixel_num: int = 0,
+    ) -> Union[torch.Tensor, None]:
+        if len(camera_list) == 0:
+            print('[WARN][Detector::detectBestAxisWorld]')
+            print('\t camera list is empty!')
+            return None
+
+        if len(camera_list) == 1:
+            return self.detectAxisWorld(
+                camera=camera_list[0],
+                use_mask=use_mask,
+                mask_smaller_pixel_num=mask_smaller_pixel_num,
+            )
+
+        src_axis_world_list = []
+        tgt_axis_world_list = []
+
+        print('[INFO][Detector::detectBestAxisWorld]')
+        print('\t start detect object axis pairs...')
+        for i in trange(len(camera_list)):
+            src_camera = camera_list[i]
+            tgt_camera = camera_list[(i + 1) % len(camera_list)]
+
+            src_axis_world, tgt_axis_world = self.detectAxisPairWorld(
+                src_camera=src_camera,
+                tgt_camera=tgt_camera,
+                use_mask=use_mask,
+                mask_smaller_pixel_num=mask_smaller_pixel_num,
+            )
+
+            if src_axis_world is None or tgt_axis_world is None:
+                print('[WARN][Detector::detectBestAxisWorld]')
+                print('\t detectAxisPairWorld failed!')
+                continue
+
+            src_axis_world_list.append(src_axis_world)
+            tgt_axis_world_list.append(tgt_axis_world)
+        return
