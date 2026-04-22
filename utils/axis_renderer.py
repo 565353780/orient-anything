@@ -72,10 +72,20 @@ class BlendRenderer:
     def render_axis(self, azi, ele, rot, alpha, save_path):
         """
         渲染特定方向的图像。
-        
-        :param azi: 方位角（绕 Z 轴旋转，弧度）
-        :param ele: 仰角（绕 Y 轴旋转，弧度）
-        :param rot: 自转（绕 X 轴旋转，弧度）
+
+        角度单位均为「度」（内部再乘 π/180 转弧度给 Blender）。
+
+        与 `utils.app_utils.azi_ele_rot_to_Obj_Rmatrix_batch` 的约定一致：
+          R = R_x(rot) · R_y(ele) · R_z(-azi)
+        在 Blender 中等价于 `rotation_mode='ZYX'` 并设置
+          rotation_euler = (rot, ele, -azi)
+        （Blender ZYX 欧拉合成为 R_x · R_y · R_z，tuple 的 3 个分量分别对应
+        X/Y/Z 角，因此第 3 个分量取 `-azi` 才能匹配矩阵中的 `R_z(-azi)`）。
+
+        :param azi: 方位角（绕 Z 轴旋转，度）
+        :param ele: 仰角（绕 Y 轴旋转，度）
+        :param rot: 自转（绕 X 轴旋转，度）
+        :param alpha: 轴的显示形态键 (0/1/2/4，参见 `alpha_axis_map`)
         :param save_path: 渲染结果保存路径（如 '/output/render.png'）
         """
         # 遍历所有对象，初始化渲染可见性
@@ -106,10 +116,15 @@ class BlendRenderer:
             if obj.type == 'MESH':
                 obj.hide_render = False
 
-        # 设置旋转（ZYX 顺序：Z=azi, Y=ele, X=rot → Euler XYZ = (rot, ele, azi)）
-        # 注意：Blender 使用弧度
-        target_obj.rotation_mode = 'ZYX'  # 确保使用欧拉角 ZYX 模式
-        target_obj.rotation_euler = (rot*math.pi/180, ele*math.pi/180, -azi*math.pi/180)
+        # 设置旋转：与姿态矩阵 R = R_x(rot) · R_y(ele) · R_z(-azi) 对应。
+        # Blender `ZYX` 欧拉合成 R_x · R_y · R_z，因此 rotation_euler 的第 3 个
+        # 分量 (Z 角) 必须取 `-azi`，而不是 `+azi`。入参是度，这里再转弧度。
+        target_obj.rotation_mode = 'ZYX'
+        target_obj.rotation_euler = (
+            rot * math.pi / 180.0,
+            ele * math.pi / 180.0,
+            -azi * math.pi / 180.0,
+        )
 
         # 确保路径目录存在
         os.makedirs(os.path.dirname(save_path), exist_ok=True)

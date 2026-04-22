@@ -71,15 +71,18 @@ def background_preprocess(input_image, do_remove_background):
     return input_image
 
 def axis_angle_rotation_batch(axis: torch.Tensor, theta: torch.Tensor, homogeneous: bool = False) -> torch.Tensor:
-    """
-    支持batch输入的版本：
+    """右手系轴角 (Rodrigues) 旋转矩阵，支持 batch。
+
+    约定：`theta > 0` 时，从 `axis` 正方向看过去，向量做逆时针 (CCW) 旋转，
+    与 Blender 欧拉角 ZYX 模式各轴分量同号。
+
     Args:
-        axis: (3,) or (N,3)
-        theta: scalar or (N,)
+        axis: (3,) 或 (N,3)
+        theta: 标量或 (N,)
         homogeneous: 是否输出 4x4 齐次矩阵
 
     Returns:
-        (N,3,3) or (N,4,4)
+        (N,3,3) 或 (N,4,4)
     """
     axis = torch.as_tensor(axis).float()
     theta = torch.as_tensor(theta).float()
@@ -90,8 +93,7 @@ def axis_angle_rotation_batch(axis: torch.Tensor, theta: torch.Tensor, homogeneo
         theta = theta.unsqueeze(0)  # (1,)
 
     N = axis.shape[0]
-    
-    # normalize axis
+
     axis = axis / torch.norm(axis, dim=1, keepdim=True)
 
     x, y, z = axis[:, 0], axis[:, 1], axis[:, 2]
@@ -99,7 +101,6 @@ def axis_angle_rotation_batch(axis: torch.Tensor, theta: torch.Tensor, homogeneo
     sin_t = torch.sin(theta)
     one_minus_cos = 1 - cos_t
 
-    # 公式展开
     rot = torch.zeros((N, 3, 3), dtype=axis.dtype, device=axis.device)
     rot[:, 0, 0] = cos_t + x*x*one_minus_cos
     rot[:, 0, 1] = x*y*one_minus_cos - z*sin_t
@@ -118,14 +119,61 @@ def axis_angle_rotation_batch(axis: torch.Tensor, theta: torch.Tensor, homogeneo
 
     return rot
 
+
+# ---------------------------------------------------------------------------
+# 旋转 <-> 欧拉角
+# ---------------------------------------------------------------------------
+#
+# 网络输出的 (azi, ele, rot) 是「物体在相机视角下的 ZYX 欧拉角」，描述的是
+# 在一个 **相机原生坐标系** 下、从 canonical 姿态旋到当前姿态的旋转。
+# 该相机原生坐标系的轴向规范为：
+#
+#     X 轴 -> 朝 "后" (指向观察者 / 相机原点后方)
+#     Y 轴 -> 朝 "右"
+#     Z 轴 -> 朝 "上"
+#
+# 旋转顺序按 ZYX (外轴固定):
+#   1. 先绕 +Z 旋转 -azi 度 (与训练数据 renderer 里 `rotation_euler[-1] = -azi` 一致)
+#   2. 再绕 +Y 旋转 ele 度
+#   3. 最后绕 +X 旋转 rot 度
+# 对列向量左乘 => R = R_x(rot) @ R_y(ele) @ R_z(-azi)
+#
+# `azi_ele_rot_to_semantic_axes` 的 3×3 输出，三列即 front/left/up 在
+# **该相机原生 (后-右-上) 坐标系** 下的分量。要把它喂给
+# `camera-control` 的 `Camera.toDirectionsWorld` / `Camera.project_points_to_uv`
+# 等接口，请先通过
+# `orient_anything.Module.detector.axes_camera_from_ref_angles` / `.axes_world_from_ref_angles`
+# 做固定的行置换 (后-右-上 → 右-上-后)，下游再直接调用 camera 的转换函数即可。
+# ---------------------------------------------------------------------------
+
+
+# 参考常量：相机位于 +X_world 看向 -X_world、up=+Z_world 这一 canonical 位姿下，
+# `Camera.R` (= `world2camera[:3, :3]`) 的期望数值。保留仅用于单元测试对齐，
+# 业务代码应当直接读取 `camera.R` 或调用 `Camera.toDirectionsWorld`。
+BLENDER_WORLD_TO_CC_CAMERA_FOR_POSX_LOOK_NEGX = torch.tensor(
+    [
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+    ],
+    dtype=torch.float32,
+)
+
+
 def azi_ele_rot_to_Obj_Rmatrix_batch(azi: torch.Tensor, ele: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
-    """支持batch输入的: (azi, ele, rot) -> R matrix (N,3,3)"""
-    # 转成tensor
+    """从 (azi, ele, rot)（度）构造物体姿态矩阵 R，batch 友好。
+
+    约定 (见文件顶部注释)：
+
+        R = R_x(rot) @ R_y(ele) @ R_z(-azi)
+
+    对列向量 v_canonical，`R @ v_canonical` 给出该向量在相机原生
+    (X=后, Y=右, Z=上) 坐标系下经过 (azi, ele, rot) 旋转后的方向。返回 (N, 3, 3)。
+    """
     azi = torch.as_tensor(azi).float() * torch.pi / 180.
     ele = torch.as_tensor(ele).float() * torch.pi / 180.
     rot = torch.as_tensor(rot).float() * torch.pi / 180.
 
-    # 保证有batch维度
     if azi.ndim == 0:
         azi = azi.unsqueeze(0)
     if ele.ndim == 0:
@@ -134,14 +182,14 @@ def azi_ele_rot_to_Obj_Rmatrix_batch(azi: torch.Tensor, ele: torch.Tensor, rot: 
         rot = rot.unsqueeze(0)
 
     N = azi.shape[0]
-    
+
     device = azi.device
     dtype = azi.dtype
-    
-    z0_axis = torch.tensor([0.,0.,1.], device=device, dtype=dtype).expand(N, -1)
-    y0_axis = torch.tensor([0.,1.,0.], device=device, dtype=dtype).expand(N, -1)
-    x0_axis = torch.tensor([1.,0.,0.], device=device, dtype=dtype).expand(N, -1)
-    # print(z0_axis.shape, azi.shape)
+
+    z0_axis = torch.tensor([0., 0., 1.], device=device, dtype=dtype).expand(N, -1)
+    y0_axis = torch.tensor([0., 1., 0.], device=device, dtype=dtype).expand(N, -1)
+    x0_axis = torch.tensor([1., 0., 0.], device=device, dtype=dtype).expand(N, -1)
+
     R_azi = axis_angle_rotation_batch(z0_axis, -1 * azi)
     R_ele = axis_angle_rotation_batch(y0_axis, ele)
     R_rot = axis_angle_rotation_batch(x0_axis, rot)
@@ -149,55 +197,121 @@ def azi_ele_rot_to_Obj_Rmatrix_batch(azi: torch.Tensor, ele: torch.Tensor, rot: 
     R_res = R_rot @ R_ele @ R_azi
     return R_res
 
-def Cam_Rmatrix_to_azi_ele_rot_batch(R: torch.Tensor):
-    """支持batch输入的: R matrix -> (azi, ele, rot)，角度制 (度)"""
-    R = torch.as_tensor(R).float()
 
-    # 如果是(3,3)，补batch维度
+def recover_semantic_axes_from_R(R_raw: torch.Tensor) -> torch.Tensor:
+    """由 `azi_ele_rot_to_Obj_Rmatrix_batch` 的输出恢复 front/left/up 语义轴。
+
+    canonical 姿态 (azi=0, ele=0, rot=0 且 R=I) 对应物体正面朝向相机，即
+    front 指向相机后方：
+
+        front (red)   = +X (= 后, 指向相机 / 观察者)
+        left  (green) = +Y (= 右)
+        up    (blue)  = +Z (= 上)
+
+    因此把 R 的三列按顺序解释为 (front, left, up) 即可，置换矩阵 P 退化为
+    单位阵。返回 (..., 3, 3)，列依次为 front/left/up 的单位方向，所处坐标系
+    与输入 `R_raw` 相同——即相机原生 (X=后, Y=右, Z=上) 坐标系。
+    """
+    R_raw = torch.as_tensor(R_raw)
+    return R_raw.clone()
+
+
+def azi_ele_rot_to_semantic_axes(
+    azi: torch.Tensor,
+    ele: torch.Tensor,
+    rot: torch.Tensor,
+) -> torch.Tensor:
+    """从 (azi, ele, rot)（度）得到相机原生 (X=后, Y=右, Z=上) 坐标系下的
+    front/left/up 三列 (N, 3, 3)。
+
+    注意：该原生坐标系与 ``camera-control`` 的 Camera 约定 (X=右, Y=上, Z=后)
+    不一致。要把结果喂给 ``Camera.toDirectionsWorld`` / ``Camera.project_points_to_uv``
+    等接口，应先通过
+    ``orient_anything.Module.detector.axes_camera_from_ref_angles`` /
+    ``axes_world_from_ref_angles`` 做一次固定行置换 (后-右-上 → 右-上-后)，
+    下游再直接使用 camera 的转换函数，不要再手写 ``camera2world[:3, :3]``
+    之类的旋转乘法。
+    """
+    R_raw = azi_ele_rot_to_Obj_Rmatrix_batch(azi, ele, rot)
+    return recover_semantic_axes_from_R(R_raw)
+
+
+def Obj_Rmatrix_to_azi_ele_rot_batch(R_raw: torch.Tensor):
+    """`azi_ele_rot_to_Obj_Rmatrix_batch` 的严格逆。
+
+    输入 `R_raw` 为相机原生 (X=后, Y=右, Z=上) 坐标系下的物体姿态矩阵 (同正向
+    函数的输出)，返回 (azi, ele, rot) 三个角度的度数。万向节 (ele = ±90°) 下
+    约定 azi = 0，将自由度全部归给 rot。
+    """
+    R = torch.as_tensor(R_raw).float()
     if R.ndim == 2:
         R = R.unsqueeze(0)
 
-    r0 = R[:, :, 0]  # shape (N,3)
-    r1 = R[:, :, 1]
-    r2 = R[:, :, 2]
-
-    ele = torch.asin(r0[:, 2])  # r0.z
+    # R = R_x(rot) @ R_y(ele) @ R_z(-azi) 的解析展开：
+    #   R[0, 0] = cos(ele) * cos(azi)
+    #   R[0, 1] = cos(ele) * sin(azi)
+    #   R[0, 2] = sin(ele)
+    #   R[1, 2] = -sin(rot) * cos(ele)
+    #   R[2, 2] =  cos(rot) * cos(ele)
+    ele = torch.asin(torch.clamp(R[:, 0, 2], min=-1.0, max=1.0))
     cos_ele = torch.cos(ele)
 
-    # 创建默认azi、rot
     azi = torch.zeros_like(ele)
     rot = torch.zeros_like(ele)
 
-    # 正常情况
-    normal_mask = (cos_ele.abs() >= 1e-6)
+    normal_mask = cos_ele.abs() >= 1e-6
     if normal_mask.any():
-        azi[normal_mask] = torch.atan2(r0[normal_mask, 1], r0[normal_mask, 0])
-        rot[normal_mask] = torch.atan2(-r1[normal_mask, 2], r2[normal_mask, 2])
+        azi[normal_mask] = torch.atan2(R[normal_mask, 0, 1], R[normal_mask, 0, 0])
+        rot[normal_mask] = torch.atan2(-R[normal_mask, 1, 2], R[normal_mask, 2, 2])
 
-    # Gimbal lock特殊情况
     gimbal_mask = ~normal_mask
     if gimbal_mask.any():
-        # 这里设azi为0
+        # 万向节：只有 (azi - sign(ele) * rot) 可辨识，约定 azi = 0，全部归给 rot。
+        #   ele = +π/2: R[1, 0] = sin(rot - azi), R[1, 1] = cos(rot - azi)
+        #   ele = -π/2: R[1, 0] = -sin(rot + azi), R[1, 1] = cos(rot + azi)
+        sign_ele = torch.sign(torch.sin(ele[gimbal_mask]))
         azi[gimbal_mask] = 0.0
-        rot[gimbal_mask] = torch.atan2(-r1[gimbal_mask, 0], r1[gimbal_mask, 1])
+        rot[gimbal_mask] = torch.atan2(sign_ele * R[gimbal_mask, 1, 0], R[gimbal_mask, 1, 1])
 
-    # 弧度转角度
     azi = azi * 180. / torch.pi
     ele = ele * 180. / torch.pi
     rot = rot * 180. / torch.pi
 
     return azi, ele, rot
 
-def Get_target_azi_ele_rot(azi: torch.Tensor, ele: torch.Tensor, rot: torch.Tensor, rel_azi: torch.Tensor, rel_ele: torch.Tensor, rel_rot: torch.Tensor):
-    Rmat0    = azi_ele_rot_to_Obj_Rmatrix_batch(azi = azi    , ele = ele    , rot = rot)
-    Rmat_rel = azi_ele_rot_to_Obj_Rmatrix_batch(azi = rel_azi, ele = rel_ele, rot = rel_rot)
-    # Rmat_rel = Rmat1 @ Rmat0.permute(0, 2, 1)
-    # azi_out, ele_out, rot_out = Cam_Rmatrix_to_azi_ele_rot_batch(Rmat_rel.permute(0, 2, 1))
-    
-    Rmat1 = Rmat_rel @ Rmat0
-    azi_out, ele_out, rot_out = Cam_Rmatrix_to_azi_ele_rot_batch(Rmat1.permute(0, 2, 1))
-    
-    return azi_out, ele_out, rot_out
+
+def Cam_Rmatrix_to_azi_ele_rot_batch(R: torch.Tensor):
+    """历史 API，保留作兼容入口。
+
+    该函数接受的是 ``R_obj.permute(0, 2, 1)`` (即 `azi_ele_rot_to_Obj_Rmatrix_batch`
+    输出的转置)。内部直接转置一次后调用 `Obj_Rmatrix_to_azi_ele_rot_batch`，
+    用户新代码请直接使用 `Obj_Rmatrix_to_azi_ele_rot_batch` 以避免语义歧义。
+    """
+    R = torch.as_tensor(R).float()
+    if R.ndim == 2:
+        R = R.unsqueeze(0)
+    return Obj_Rmatrix_to_azi_ele_rot_batch(R.permute(0, 2, 1))
+
+
+def Get_target_azi_ele_rot(
+    azi: torch.Tensor,
+    ele: torch.Tensor,
+    rot: torch.Tensor,
+    rel_azi: torch.Tensor,
+    rel_ele: torch.Tensor,
+    rel_rot: torch.Tensor,
+):
+    """把 ref 角 + rel 角组合成 target 角。
+
+    约定 ``R_target = R_rel @ R_ref`` (rel 在相机原生 (X=后, Y=右, Z=上) 坐标系
+    下对 ref 做左乘)，与 `Get_relate_azi_ele_rot` 的定义
+    ``R_rel = R_target @ R_ref.T`` 互为逆运算。
+    """
+    Rmat_ref = azi_ele_rot_to_Obj_Rmatrix_batch(azi=azi, ele=ele, rot=rot)
+    Rmat_rel = azi_ele_rot_to_Obj_Rmatrix_batch(azi=rel_azi, ele=rel_ele, rot=rel_rot)
+
+    Rmat_target = Rmat_rel @ Rmat_ref
+    return Obj_Rmatrix_to_azi_ele_rot_batch(Rmat_target)
 
 from PIL import Image
 import torch.nn.functional as F
@@ -432,7 +546,6 @@ def inf_single_case(model, image_ref, image_tgt):
         image_list = [image_ref, image_tgt]
     image_tensors = preprocess_images(image_list, mode="pad").to(model.get_device())
     ans_dict = inf_single_batch(model=model, batch=image_tensors.unsqueeze(0))
-    print(ans_dict)
     return ans_dict
 
 

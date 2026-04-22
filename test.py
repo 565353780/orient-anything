@@ -5,15 +5,17 @@
     az/el/ro  ──► _axis_cam_from_ref_angles  ──►  3x3 axis_cam (front/left/up)
               ──► _saveAxisWorldMeshes       ──►  合并后的 .ply (R/G/B 三色箭头)
 
-与 Blender 路径 (`utils.axis_renderer.BlendRenderer`) 不同，这里仅依赖
-`azi_ele_rot_to_semantic_axes` + Open3D 箭头网格，无需 `bpy`/`.blend` 资源。
+``_axis_cam_from_ref_angles`` 的输出已经是 **camera-control 相机坐标系**
+(X=右, Y=上, Z=后) 下的 3x3 方向，内部通过
+``orient_anything.Module.detector.axes_camera_from_ref_angles`` 做了一次
+固定的行置换 (后-右-上 → 右-上-后)，随后下游若需要世界系方向，应直接走
+``axes_world_from_ref_angles`` / ``camera.toDirectionsWorld``，不应再手写
+任何 ``camera2world[:3, :3]`` 乘法。
 
-注意：网络预测的 `(az, el, ro)` 本身是物体在 **相机坐标系** 下的 ZYX 欧拉角，
-所以这里使用的是 `_axis_cam_from_ref_angles` 取相机系三轴；导出 `.ply` 相当
-于把该相机系可视化到文件。当相机处于「位于 +X 轴正半轴、朝向 -X、Y/Z 分别
-朝右/朝上」的 canonical 位姿时，camera-frame 与肉眼在 Blender 里观察到的
-Blender-world 朝向一一对应；其他相机下需通过 `_axis_world_from_ref_angles`
-搭配真实的 `camera.camera2world` 才能得到世界系三轴。
+本脚本只导出「相机系」三轴 mesh，主要用于直观检查：当相机处于「+X 半轴、
+朝向 -X、Y/Z 朝右/朝上」的 canonical 位姿时，相机系的三根轴与常规 world
+空间渲染肉眼一致；其他位姿下请用 ``_axis_world_from_ref_angles`` 先转到
+世界系再导出。
 
 覆盖 7 种非空组合（`2^3 - 1 = 7`）：
   - 单轴：azi / ele / rot 各自为 45°；
