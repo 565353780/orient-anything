@@ -195,7 +195,7 @@ def demo_camera_list():
 
     assert detector.is_valid
 
-    best_axis_world = detector.detectBestAxisWorld(camera_list)
+    best_axis_world = detector.detectBestAxisWorld(camera_list, camera_offset=1)
 
     axis = createAxisMesh(best_axis_world)
 

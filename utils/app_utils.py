@@ -1,9 +1,14 @@
 import rembg
 import torch
 import numpy as np
+import torch.nn.functional as F
 
 from PIL import Image
 from typing import Any
+from functools import partial
+from scipy.optimize import curve_fit
+from scipy.integrate import trapezoid
+from torchvision import transforms as TF
 
 
 def resize_foreground(
@@ -313,15 +318,6 @@ def Get_target_azi_ele_rot(
     Rmat_target = Rmat_rel @ Rmat_ref
     return Obj_Rmatrix_to_azi_ele_rot_batch(Rmat_target)
 
-from PIL import Image
-import torch.nn.functional as F
-from torchvision import transforms as TF
-
-from scipy.special import i0
-from scipy.optimize import curve_fit
-from scipy.integrate import trapezoid
-from functools import partial
-
 def von_mises_pdf_alpha_numpy(alpha, x, mu, kappa):
     normalization = 2 * np.pi
     pdf = np.exp(kappa * np.cos(alpha * (x - mu))) / normalization
@@ -362,7 +358,7 @@ def val_fit_alpha(distribute):
         alpha = alphas[max_index]
         mu_fit, kappa_fit = saved_params[max_index]
         r_squared = saved_r_squared[max_index]
-        print(saved_params, saved_r_squared)
+        #print(saved_params, saved_r_squared)
         if alpha == 1. and kappa_fit>=0.6 and r_squared>=0.45:
             pass
         elif alpha == 2. and kappa_fit>=0.5 and r_squared>=0.45:

@@ -286,6 +286,7 @@ class Detector(object):
     def detectBestAxisWorld(
         self,
         camera_list: List[Camera],
+        camera_offset: int=1,
         use_mask: bool = True,
         mask_smaller_pixel_num: int = 0,
     ) -> Union[torch.Tensor, None]:
@@ -308,7 +309,7 @@ class Detector(object):
         print('\t start detect object axis pairs...')
         for i in trange(len(camera_list)):
             src_camera = camera_list[i]
-            tgt_camera = camera_list[(i + 1) % len(camera_list)]
+            tgt_camera = camera_list[(i + camera_offset) % len(camera_list)]
 
             src_axis_world, tgt_axis_world = self.detectAxisPairWorld(
                 src_camera=src_camera,
@@ -324,4 +325,9 @@ class Detector(object):
 
             src_axis_world_list.append(src_axis_world)
             tgt_axis_world_list.append(tgt_axis_world)
-        return
+
+        print(len(src_axis_world_list))
+        print(len(tgt_axis_world_list))
+        print(src_axis_world_list[0].shape)
+
+        return src_axis_world_list[0]
