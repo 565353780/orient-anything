@@ -197,7 +197,6 @@ def demo_camera_list():
     )
     assert best_axis_world is not None
 
-    # 当前还没有实现真正的 "best" 聚合，暂取第 0 个相机对应的结果可视化。
     axis = createAxisMesh(best_axis_world)
 
     collection_mesh = o3d.geometry.TriangleMesh()
