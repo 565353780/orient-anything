@@ -541,38 +541,25 @@ class Detector(object):
                 return None, None
             return axis, axis
 
-        tmp_axis_src_file_path = './output/tmp_axis_src_world.npy'
-        tmp_axis_tgt_file_path = './output/tmp_axis_tgt_world.npy'
+        N = len(camera_list)
+        src_cam_list: List[Camera] = [
+            camera_list[i] for i in range(N)
+        ]
+        tgt_cam_list: List[Camera] = [
+            camera_list[(i + camera_offset) % N] for i in range(N)
+        ]
 
-        if os.path.exists(tmp_axis_src_file_path) and os.path.exists(tmp_axis_tgt_file_path):
-            src_axes_all = np.load(tmp_axis_src_file_path)
-            tgt_axes_all = np.load(tmp_axis_tgt_file_path)
-            src_axes_all = torch.from_numpy(src_axes_all).to(dtype=self.dtype)
-            tgt_axes_all = torch.from_numpy(tgt_axes_all).to(dtype=self.dtype)
-        else:
-            N = len(camera_list)
-            src_cam_list: List[Camera] = [
-                camera_list[i] for i in range(N)
-            ]
-            tgt_cam_list: List[Camera] = [
-                camera_list[(i + camera_offset) % N] for i in range(N)
-            ]
-
-            print('[INFO][Detector::detectBestAxisWorld]')
-            print('\t start detect object axis pairs...')
-            src_axes_all, tgt_axes_all = self.detectAxisPairWorld(
-                src_camera=src_cam_list,
-                tgt_camera=tgt_cam_list,
-                use_mask=use_mask,
-                mask_smaller_pixel_num=mask_smaller_pixel_num,
-                mini_batch_size=mini_batch_size,
-            )
-            if src_axes_all is None or tgt_axes_all is None:
-                return None, None
-
-            # detectAxisPairWorld 已返回 CPU tensor
-            np.save(tmp_axis_src_file_path, src_axes_all.detach().cpu().numpy())
-            np.save(tmp_axis_tgt_file_path, tgt_axes_all.detach().cpu().numpy())
+        print('[INFO][Detector::detectBestAxisWorld]')
+        print('\t start detect object axis pairs...')
+        src_axes_all, tgt_axes_all = self.detectAxisPairWorld(
+            src_camera=src_cam_list,
+            tgt_camera=tgt_cam_list,
+            use_mask=use_mask,
+            mask_smaller_pixel_num=mask_smaller_pixel_num,
+            mini_batch_size=mini_batch_size,
+        )
+        if src_axes_all is None or tgt_axes_all is None:
+            return None, None
 
         fuse_axis_world = fuseAxisWorld(src_axes_all, tgt_axes_all)
 
