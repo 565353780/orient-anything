@@ -1,3 +1,4 @@
+import gc
 import os
 from orient_anything.Method.axis_fusion import fuseAxisWorld
 import torch
@@ -79,7 +80,7 @@ class Detector(object):
             nopretrain=nopretrain,
         )
 
-        self.model = self.model.to(self.device)
+        self.model = self.model.to('cpu')
         self.model.eval()
         self.model.requires_grad_(False)
 
@@ -98,7 +99,7 @@ class Detector(object):
 
         model_state_dict = torch.load(model_file_path, map_location='cpu')
         self.model.load_state_dict(model_state_dict, strict=True)
-        self.model = self.model.to(self.device)
+        self.model = self.model.to('cpu')
         self.model.eval()
         self.model.requires_grad_(False)
 
@@ -113,6 +114,19 @@ class Detector(object):
         print('[ERROR][Detector::_ensureValid]')
         print('\t detector is not valid, please call loadModel() first!')
         return False
+
+    def _toGPU(self) -> None:
+        if self.model is not None:
+            self.model.to(self.device)
+        return
+
+    def _toCPU(self) -> None:
+        if self.model is not None:
+            self.model.to('cpu')
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return
 
     def _runInferenceBatch(
         self,
@@ -250,16 +264,20 @@ class Detector(object):
         if not self._ensureValid():
             return None
 
-        image_list = _asList(image)
-        ref_rgb_list = [toRGBUint8(img) for img in image_list]
-        result = self._runInferenceBatchChunked(
-            ref_rgb_list, mini_batch_size=mini_batch_size,
-        )
+        self._toGPU()
+        try:
+            image_list = _asList(image)
+            ref_rgb_list = [toRGBUint8(img) for img in image_list]
+            result = self._runInferenceBatchChunked(
+                ref_rgb_list, mini_batch_size=mini_batch_size,
+            )
 
-        axes_cam = axes_camera_from_ref_angles(
-            result['src_azi'], result['src_ele'], result['src_rot'],
-        )  # (B, 3, 3) cols=dirs
-        return self._rowsDirsFromCols(axes_cam)
+            axes_cam = axes_camera_from_ref_angles(
+                result['src_azi'], result['src_ele'], result['src_rot'],
+            )  # (B, 3, 3) cols=dirs
+            return self._rowsDirsFromCols(axes_cam).detach().cpu()
+        finally:
+            self._toCPU()
 
     @torch.no_grad()
     def detectFile(
@@ -279,15 +297,19 @@ class Detector(object):
                 print('\t image_file_path:', path)
                 return None
 
-        ref_rgb_list = [loadImageRGB(p) for p in path_list]
-        result = self._runInferenceBatchChunked(
-            ref_rgb_list, mini_batch_size=mini_batch_size,
-        )
+        self._toGPU()
+        try:
+            ref_rgb_list = [loadImageRGB(p) for p in path_list]
+            result = self._runInferenceBatchChunked(
+                ref_rgb_list, mini_batch_size=mini_batch_size,
+            )
 
-        axes_cam = axes_camera_from_ref_angles(
-            result['src_azi'], result['src_ele'], result['src_rot'],
-        )
-        return self._rowsDirsFromCols(axes_cam)
+            axes_cam = axes_camera_from_ref_angles(
+                result['src_azi'], result['src_ele'], result['src_rot'],
+            )
+            return self._rowsDirsFromCols(axes_cam).detach().cpu()
+        finally:
+            self._toCPU()
 
     @torch.no_grad()
     def detectPair(
@@ -310,22 +332,26 @@ class Detector(object):
             )
             return None, None
 
-        ref_rgb_list = [toRGBUint8(img) for img in ref_list]
-        tgt_rgb_list = [toRGBUint8(img) for img in tgt_list]
-        result = self._runInferenceBatchChunked(
-            ref_rgb_list, tgt_rgb_list, mini_batch_size=mini_batch_size,
-        )
+        self._toGPU()
+        try:
+            ref_rgb_list = [toRGBUint8(img) for img in ref_list]
+            tgt_rgb_list = [toRGBUint8(img) for img in tgt_list]
+            result = self._runInferenceBatchChunked(
+                ref_rgb_list, tgt_rgb_list, mini_batch_size=mini_batch_size,
+            )
 
-        src_axes = axes_camera_from_ref_angles(
-            result['src_azi'], result['src_ele'], result['src_rot'],
-        )
-        tgt_axes = axes_camera_from_ref_angles(
-            result['tgt_azi'], result['tgt_ele'], result['tgt_rot'],
-        )
-        return (
-            self._rowsDirsFromCols(src_axes),
-            self._rowsDirsFromCols(tgt_axes),
-        )
+            src_axes = axes_camera_from_ref_angles(
+                result['src_azi'], result['src_ele'], result['src_rot'],
+            )
+            tgt_axes = axes_camera_from_ref_angles(
+                result['tgt_azi'], result['tgt_ele'], result['tgt_rot'],
+            )
+            return (
+                self._rowsDirsFromCols(src_axes).detach().cpu(),
+                self._rowsDirsFromCols(tgt_axes).detach().cpu(),
+            )
+        finally:
+            self._toCPU()
 
     @torch.no_grad()
     def detectPairFiles(
@@ -359,22 +385,26 @@ class Detector(object):
                 print('\t tgt_image_file_path:', p)
                 return None, None
 
-        ref_rgb_list = [loadImageRGB(p) for p in ref_paths]
-        tgt_rgb_list = [loadImageRGB(p) for p in tgt_paths]
-        result = self._runInferenceBatchChunked(
-            ref_rgb_list, tgt_rgb_list, mini_batch_size=mini_batch_size,
-        )
+        self._toGPU()
+        try:
+            ref_rgb_list = [loadImageRGB(p) for p in ref_paths]
+            tgt_rgb_list = [loadImageRGB(p) for p in tgt_paths]
+            result = self._runInferenceBatchChunked(
+                ref_rgb_list, tgt_rgb_list, mini_batch_size=mini_batch_size,
+            )
 
-        src_axes = axes_camera_from_ref_angles(
-            result['src_azi'], result['src_ele'], result['src_rot'],
-        )
-        tgt_axes = axes_camera_from_ref_angles(
-            result['tgt_azi'], result['tgt_ele'], result['tgt_rot'],
-        )
-        return (
-            self._rowsDirsFromCols(src_axes),
-            self._rowsDirsFromCols(tgt_axes),
-        )
+            src_axes = axes_camera_from_ref_angles(
+                result['src_azi'], result['src_ele'], result['src_rot'],
+            )
+            tgt_axes = axes_camera_from_ref_angles(
+                result['tgt_azi'], result['tgt_ele'], result['tgt_rot'],
+            )
+            return (
+                self._rowsDirsFromCols(src_axes).detach().cpu(),
+                self._rowsDirsFromCols(tgt_axes).detach().cpu(),
+            )
+        finally:
+            self._toCPU()
 
     @torch.no_grad()
     def detectAxisWorld(
@@ -393,24 +423,29 @@ class Detector(object):
             return None
 
         camera_list = _asList(camera)
-        ref_rgb_list = [
-            toRGBUint8(
-                cam.toImage(
-                    use_mask=use_mask,
-                    mask_smaller_pixel_num=mask_smaller_pixel_num,
-                )
-            )
-            for cam in camera_list
-        ]
-        result = self._runInferenceBatchChunked(
-            ref_rgb_list, mini_batch_size=mini_batch_size,
-        )
 
-        axes_world = axes_world_from_ref_angles(
-            result['src_azi'], result['src_ele'], result['src_rot'],
-            camera_list,
-        )  # (B, 3, 3) cols=dirs
-        return self._rowsDirsFromCols(axes_world)
+        self._toGPU()
+        try:
+            ref_rgb_list = [
+                toRGBUint8(
+                    cam.toImage(
+                        use_mask=use_mask,
+                        mask_smaller_pixel_num=mask_smaller_pixel_num,
+                    )
+                )
+                for cam in camera_list
+            ]
+            result = self._runInferenceBatchChunked(
+                ref_rgb_list, mini_batch_size=mini_batch_size,
+            )
+
+            axes_world = axes_world_from_ref_angles(
+                result['src_azi'], result['src_ele'], result['src_rot'],
+                camera_list,
+            )  # (B, 3, 3) cols=dirs
+            return self._rowsDirsFromCols(axes_world).detach().cpu()
+        finally:
+            self._toCPU()
 
     @torch.no_grad()
     def detectAxisPairWorld(
@@ -436,40 +471,44 @@ class Detector(object):
             )
             return None, None
 
-        src_rgb_list = [
-            toRGBUint8(
-                cam.toImage(
-                    use_mask=use_mask,
-                    mask_smaller_pixel_num=mask_smaller_pixel_num,
+        self._toGPU()
+        try:
+            src_rgb_list = [
+                toRGBUint8(
+                    cam.toImage(
+                        use_mask=use_mask,
+                        mask_smaller_pixel_num=mask_smaller_pixel_num,
+                    )
                 )
-            )
-            for cam in src_list
-        ]
-        tgt_rgb_list = [
-            toRGBUint8(
-                cam.toImage(
-                    use_mask=use_mask,
-                    mask_smaller_pixel_num=mask_smaller_pixel_num,
+                for cam in src_list
+            ]
+            tgt_rgb_list = [
+                toRGBUint8(
+                    cam.toImage(
+                        use_mask=use_mask,
+                        mask_smaller_pixel_num=mask_smaller_pixel_num,
+                    )
                 )
+                for cam in tgt_list
+            ]
+            result = self._runInferenceBatchChunked(
+                src_rgb_list, tgt_rgb_list, mini_batch_size=mini_batch_size,
             )
-            for cam in tgt_list
-        ]
-        result = self._runInferenceBatchChunked(
-            src_rgb_list, tgt_rgb_list, mini_batch_size=mini_batch_size,
-        )
 
-        src_axes_world = axes_world_from_ref_angles(
-            result['src_azi'], result['src_ele'], result['src_rot'],
-            src_list,
-        )
-        tgt_axes_world = axes_world_from_ref_angles(
-            result['tgt_azi'], result['tgt_ele'], result['tgt_rot'],
-            tgt_list,
-        )
-        return (
-            self._rowsDirsFromCols(src_axes_world),
-            self._rowsDirsFromCols(tgt_axes_world),
-        )
+            src_axes_world = axes_world_from_ref_angles(
+                result['src_azi'], result['src_ele'], result['src_rot'],
+                src_list,
+            )
+            tgt_axes_world = axes_world_from_ref_angles(
+                result['tgt_azi'], result['tgt_ele'], result['tgt_rot'],
+                tgt_list,
+            )
+            return (
+                self._rowsDirsFromCols(src_axes_world).detach().cpu(),
+                self._rowsDirsFromCols(tgt_axes_world).detach().cpu(),
+            )
+        finally:
+            self._toCPU()
 
     @torch.no_grad()
     def detectBestAxisWorld(
@@ -508,8 +547,8 @@ class Detector(object):
         if os.path.exists(tmp_axis_src_file_path) and os.path.exists(tmp_axis_tgt_file_path):
             src_axes_all = np.load(tmp_axis_src_file_path)
             tgt_axes_all = np.load(tmp_axis_tgt_file_path)
-            src_axes_all = torch.from_numpy(src_axes_all).to(device=self.device, dtype=self.dtype)
-            tgt_axes_all = torch.from_numpy(tgt_axes_all).to(device=self.device, dtype=self.dtype)
+            src_axes_all = torch.from_numpy(src_axes_all).to(dtype=self.dtype)
+            tgt_axes_all = torch.from_numpy(tgt_axes_all).to(dtype=self.dtype)
         else:
             N = len(camera_list)
             src_cam_list: List[Camera] = [
@@ -531,10 +570,17 @@ class Detector(object):
             if src_axes_all is None or tgt_axes_all is None:
                 return None, None
 
-            # 保存推理结果为npy文件
-            np.save(tmp_axis_src_file_path, src_axes_all.cpu().numpy())
-            np.save(tmp_axis_tgt_file_path, tgt_axes_all.cpu().numpy())
+            # detectAxisPairWorld 已返回 CPU tensor
+            np.save(tmp_axis_src_file_path, src_axes_all.detach().cpu().numpy())
+            np.save(tmp_axis_tgt_file_path, tgt_axes_all.detach().cpu().numpy())
 
         fuse_axis_world = fuseAxisWorld(src_axes_all, tgt_axes_all)
+
+        if isinstance(fuse_axis_world, torch.Tensor):
+            fuse_axis_world = fuse_axis_world.detach().cpu()
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return fuse_axis_world
