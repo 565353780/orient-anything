@@ -5,6 +5,7 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '7'
 
 import cv2
+import torch
 import open3d as o3d
 
 from camera_control.Method.mesh import createAxisMesh
@@ -20,17 +21,10 @@ from orient_anything.Method.render import drawAxesOnImage
 from orient_anything.Module.detector import Detector
 
 
-def _printSrcAngles(result):
-    print('\t src rotation(-180~179, deg):', result['src_rot'])
-    print('\t src polar   (-90~89, deg):', result['src_ele'])
-    print('\t src azimuth (0~360, deg):', result['src_azi'])
-    return
-
-
-def _printTgtAngles(result):
-    print('\t tgt rotation(-180~179, deg):', result['tgt_rot'])
-    print('\t tgt polar   (-90~89, deg):', result['tgt_ele'])
-    print('\t tgt azimuth (0~360, deg):', result['tgt_azi'])
+def _printAxes(label: str, axes_3x3: torch.Tensor) -> None:
+    """辅助：以 rows=dirs 约定打印三根语义轴。"""
+    print(f'\t {label} axes (rows = front/left/up):')
+    print(axes_3x3.detach().cpu().numpy())
     return
 
 
@@ -53,10 +47,11 @@ def demo_single_image():
 
     src_image = cv2.imread(image_file_path)
 
-    single_result = detector.detect(src_image)
+    single_axes = detector.detect(src_image)
 
-    assert single_result is not None
-    _printSrcAngles(single_result)
+    assert single_axes is not None
+    assert single_axes.shape == (1, 3, 3), single_axes.shape
+    _printAxes('camera-system src', single_axes[0])
     return True
 
 def demo_single_camera():
@@ -79,15 +74,18 @@ def demo_single_camera():
 
     src_image = camera_list[0].toImage()
 
-    single_result = detector.detect(src_image)
-
-    assert single_result is not None
-    _printSrcAngles(single_result)
+    # detect 返回相机坐标系语义轴 (1, 3, 3)；绘图需要世界系，故改用
+    # detectAxisWorld 以便直接拿到 (1, 3, 3) 的 world 系轴矩阵。
+    axis_world_batch = detector.detectAxisWorld(camera_list[0])
+    assert axis_world_batch is not None and axis_world_batch.shape == (1, 3, 3)
+    _printAxes('world src', axis_world_batch[0])
 
     image_save_path = os.path.join(
         output_folder_path, f'single_camera', 'axis_overlay.png'
     )
-    drawAxesOnImage(src_image, single_result, camera_list[0], image_save_path)
+    drawAxesOnImage(
+        src_image, axis_world_batch[0], camera_list[0], image_save_path
+    )
     return True
 
 def demo_camera_pair():
@@ -116,30 +114,34 @@ def demo_camera_pair():
     src_camera = camera_list[0]
     src_image = camera_list[0].toImage()
 
-    axis_world = detector.detectAxisWorld(camera_list[0])
-    axis_single = createAxisMesh(axis_world)
+    axis_world_batch = detector.detectAxisWorld(camera_list[0])
+    assert axis_world_batch is not None and axis_world_batch.shape == (1, 3, 3)
+    axis_single = createAxisMesh(axis_world_batch[0])
 
-    print('[INFO][Demo::demo] pair image inference')
+    print('[INFO][Demo::demo] pair image / pair camera inference')
     tgt_camera = fps_camera_list[1]
     tgt_image = tgt_camera.toImage()
-    pair_result = detector.detectPair(
-        src_image,
-        tgt_image,
+
+    src_axes_world, tgt_axes_world = detector.detectAxisPairWorld(
+        src_camera,
+        tgt_camera,
     )
-    _printSrcAngles(pair_result)
-    _printTgtAngles(pair_result)
+    assert src_axes_world is not None and tgt_axes_world is not None
+    assert src_axes_world.shape == (1, 3, 3)
+    assert tgt_axes_world.shape == (1, 3, 3)
+    _printAxes('world src', src_axes_world[0])
+    _printAxes('world tgt', tgt_axes_world[0])
 
     pair_dir = os.path.join(output_folder_path, f'camera_pair')
     pair_src_overlay = os.path.join(pair_dir, 'pair_axis_src_overlay.png')
     pair_tgt_overlay = os.path.join(pair_dir, 'pair_axis_tgt_overlay.png')
     pair_concat_path = os.path.join(pair_dir, 'pair_axis_concat.png')
-    drawAxesOnImage(src_image, pair_result, src_camera, pair_src_overlay)
-    tgt_result_for_draw = {
-        'src_azi': float(pair_result['tgt_azi']),
-        'src_ele': float(pair_result['tgt_ele']),
-        'src_rot': float(pair_result['tgt_rot']),
-    }
-    drawAxesOnImage(tgt_image, tgt_result_for_draw, tgt_camera, pair_tgt_overlay)
+    drawAxesOnImage(
+        src_image, src_axes_world[0], src_camera, pair_src_overlay
+    )
+    drawAxesOnImage(
+        tgt_image, tgt_axes_world[0], tgt_camera, pair_tgt_overlay
+    )
     concat_rgb = concatHorizontal(
         loadImageRGB(pair_src_overlay),
         loadImageRGB(pair_tgt_overlay),
@@ -149,16 +151,9 @@ def demo_camera_pair():
         f'[INFO][Demo::demo] saved pair axis concat image to: {pair_concat_path}'
     )
 
-    src_axis_world, tgt_axis_world = detector.detectAxisPairWorld(
-        src_camera,
-        tgt_camera,
-    )
-    print(src_axis_world)
-    print(tgt_axis_world)
-
-    # 同上：列 = front/left/up → 行 = 方向。
-    axis_src = createAxisMesh(src_axis_world)
-    axis_tgt = createAxisMesh(tgt_axis_world)
+    # 同上：rows = front/left/up 方向。
+    axis_src = createAxisMesh(src_axes_world[0])
+    axis_tgt = createAxisMesh(tgt_axes_world[0])
 
     collection_mesh = o3d.geometry.TriangleMesh()
 
@@ -195,9 +190,16 @@ def demo_camera_list():
 
     assert detector.is_valid
 
-    best_axis_world = detector.detectBestAxisWorld(camera_list, camera_offset=1)
+    best_axis_world_batch = detector.detectBestAxisWorld(
+        camera_list,
+        camera_offset=1,
+        mini_batch_size=40,
+    )
+    assert best_axis_world_batch is not None
+    assert best_axis_world_batch.shape == (len(camera_list), 3, 3)
 
-    axis = createAxisMesh(best_axis_world)
+    # 当前还没有实现真正的 "best" 聚合，暂取第 0 个相机对应的结果可视化。
+    axis = createAxisMesh(best_axis_world_batch[0])
 
     collection_mesh = o3d.geometry.TriangleMesh()
 

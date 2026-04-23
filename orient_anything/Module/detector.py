@@ -3,17 +3,20 @@ import torch
 import numpy as np
 
 from tqdm import trange
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 from camera_control.Module.camera import Camera
 
 from vision_tower import VGGT_OriAny_Ref
 from utils.app_utils import (
     Get_target_azi_ele_rot,
-    inf_single_case,
+    preprocess_images,
 )
 
-from orient_anything.Method.axis import axes_world_from_ref_angles
+from orient_anything.Method.axis import (
+    axes_camera_from_ref_angles,
+    axes_world_from_ref_angles,
+)
 from orient_anything.Method.image import loadImageRGB, toRGBUint8
 
 
@@ -31,15 +34,21 @@ def _auto_dtype() -> torch.dtype:
 def _npToPilForModel(image_rgb_uint8: np.ndarray):
     """**唯一残留的 PIL 桥接点**：把 RGB uint8 ``numpy.ndarray`` 转为 ``PIL.Image``。
 
-    ``utils/app_utils.py`` 中的 ``background_preprocess`` / ``inf_single_case``
-    （以及它内部的 ``preprocess_images``）是第三方模型侧的预处理，内部强依赖
-    PIL（``img.mode`` / ``img.size`` / ``img.convert`` / ``img.resize`` 等）。
-    为避免改动模型输入分布，这里保留一个局部、单向的 numpy → PIL 转换，
-    业务代码 (``Method/*`` / ``Demo/*``) 全部只跟 numpy + cv2 打交道。
+    ``utils/app_utils.py`` 中的 ``preprocess_images`` 是第三方模型侧预处理，内部强
+    依赖 PIL (``img.mode`` / ``img.size`` / ``img.convert`` / ``img.resize`` 等)；
+    为避免改动模型输入分布，这里保留一个局部、单向的 numpy → PIL 转换，业务
+    代码 (``Method/*`` / ``Demo/*``) 只跟 numpy + cv2 打交道。
     """
     from PIL import Image
 
     return Image.fromarray(image_rgb_uint8)
+
+
+def _asList(item_or_items: Any) -> List[Any]:
+    """把单个元素或 list/tuple 统一成 ``list``，供 batch 接口消费。"""
+    if isinstance(item_or_items, (list, tuple)):
+        return list(item_or_items)
+    return [item_or_items]
 
 
 class Detector(object):
@@ -97,14 +106,6 @@ class Detector(object):
         self.is_valid = True
         return True
 
-    @staticmethod
-    def _extractScalar(value: Any) -> float:
-        if isinstance(value, torch.Tensor):
-            return float(value.detach().cpu().reshape(-1)[0].item())
-        if isinstance(value, np.ndarray):
-            return float(value.reshape(-1)[0])
-        return float(value)
-
     def _ensureValid(self) -> bool:
         if self.is_valid:
             return True
@@ -112,184 +113,320 @@ class Detector(object):
         print('\t detector is not valid, please call loadModel() first!')
         return False
 
-    def _runInference(
+    def _runInferenceBatch(
         self,
-        ref_image_rgb: np.ndarray,
-        tgt_image_rgb: Optional[np.ndarray]=None,
-    ) -> Dict[str, float]:
-        # 模型侧 (utils/app_utils.preprocess_images) 要求 PIL 输入，这里做唯一一次
-        # numpy → PIL 的局部转换，尽量靠近调用点以便后续模型预处理被完全替换后可直接删除。
-        ref_for_model = _npToPilForModel(ref_image_rgb)
-        tgt_for_model = (
-            _npToPilForModel(tgt_image_rgb) if tgt_image_rgb is not None else None
-        )
+        ref_images_rgb: List[np.ndarray],
+        tgt_images_rgb: Optional[List[np.ndarray]] = None,
+    ) -> dict:
+        """真正的批量推理入口。
 
-        ans_dict = inf_single_case(self.model, ref_for_model, tgt_for_model)
+        - ``ref_images_rgb`` 必为长度 B 的 HWC RGB uint8 ``np.ndarray`` 列表；
+        - ``tgt_images_rgb`` 为 ``None`` 表示单图模式 (S=1)，否则必须与 ref 等长
+          (S=2，组成 B 个 (ref, tgt) 配对)。
 
-        src_azi = self._extractScalar(ans_dict['ref_az_pred'])
-        src_ele = self._extractScalar(ans_dict['ref_el_pred'])
-        src_rot = self._extractScalar(ans_dict['ref_ro_pred'])
+        返回字典，角度均为 **(B,) CPU float32 ``torch.Tensor``**：
+            ``src_azi`` / ``src_ele`` / ``src_rot``            (始终存在)
+            ``tgt_azi`` / ``tgt_ele`` / ``tgt_rot``            (仅成对模式)
+        """
+        B = len(ref_images_rgb)
+        if B == 0:
+            raise ValueError('[Detector] ref_images_rgb is empty')
+
+        has_tgt = tgt_images_rgb is not None
+        if has_tgt:
+            if len(tgt_images_rgb) != B:
+                raise ValueError(
+                    f'[Detector] tgt batch size {len(tgt_images_rgb)} != ref batch size {B}'
+                )
+            pil_list = []
+            for r, t in zip(ref_images_rgb, tgt_images_rgb):
+                pil_list.append(_npToPilForModel(r))
+                pil_list.append(_npToPilForModel(t))
+            S = 2
+        else:
+            pil_list = [_npToPilForModel(img) for img in ref_images_rgb]
+            S = 1
+
+        # ``preprocess_images`` 把 len=B*S 的 PIL 列表 stack 成 (B*S, C, H, W)，
+        # 再 reshape 回 (B, S, C, H, W) 喂给模型一次性批推。
+        image_tensors = preprocess_images(pil_list, mode='pad').to(self.device)
+        C, H, W = image_tensors.shape[-3:]
+        image_tensors = image_tensors.reshape(B, S, C, H, W)
+
+        pose_enc = self.model(image_tensors)  # (B, S, D)
+        pose_enc = pose_enc.reshape(B * S, -1)
+
+        angle_az = torch.argmax(pose_enc[:, 0:360], dim=-1).to(torch.float32)
+        angle_el = (
+            torch.argmax(pose_enc[:, 360:360 + 180], dim=-1) - 90
+        ).to(torch.float32)
+        angle_ro = (
+            torch.argmax(pose_enc[:, 360 + 180:360 + 180 + 360], dim=-1) - 180
+        ).to(torch.float32)
+
+        angle_az = angle_az.view(B, S).detach().cpu()
+        angle_el = angle_el.view(B, S).detach().cpu()
+        angle_ro = angle_ro.view(B, S).detach().cpu()
 
         result = {
-            'src_azi': src_azi,
-            'src_ele': src_ele,
-            'src_rot': src_rot,
+            'src_azi': angle_az[:, 0],
+            'src_ele': angle_el[:, 0],
+            'src_rot': angle_ro[:, 0],
         }
 
-        if tgt_image_rgb is not None:
-            rel_az = self._extractScalar(ans_dict['rel_az_pred'])
-            rel_el = self._extractScalar(ans_dict['rel_el_pred'])
-            rel_ro = self._extractScalar(ans_dict['rel_ro_pred'])
+        if has_tgt:
+            rel_az = angle_az[:, 1]
+            rel_el = angle_el[:, 1]
+            rel_ro = angle_ro[:, 1]
 
-            tgt_azi_t, tgt_ele_t, tgt_rot_t = Get_target_azi_ele_rot(
-                src_azi, src_ele, src_rot, rel_az, rel_el, rel_ro,
+            tgt_azi, tgt_ele, tgt_rot = Get_target_azi_ele_rot(
+                result['src_azi'], result['src_ele'], result['src_rot'],
+                rel_az, rel_el, rel_ro,
             )
-            result['tgt_azi'] = self._extractScalar(tgt_azi_t)
-            result['tgt_ele'] = self._extractScalar(tgt_ele_t)
-            result['tgt_rot'] = self._extractScalar(tgt_rot_t)
+            result['tgt_azi'] = tgt_azi.to(torch.float32)
+            result['tgt_ele'] = tgt_ele.to(torch.float32)
+            result['tgt_rot'] = tgt_rot.to(torch.float32)
 
         return result
+
+    @staticmethod
+    def _rowsDirsFromCols(axes_cols: torch.Tensor) -> torch.Tensor:
+        """把 ``(B, 3, 3)`` 的 cols=dirs 矩阵转成 rows=dirs (对外公共约定)。"""
+        return axes_cols.transpose(-1, -2).contiguous()
 
     @torch.no_grad()
     def detect(
         self,
         image: Any,
-    ) -> Union[Dict[str, float], None]:
+    ) -> Union[torch.Tensor, None]:
+        """批量推理相机坐标系下的语义轴矩阵。
+
+        ``image`` 可以是单张图片 (``np.ndarray`` / ``torch.Tensor``) 或同构的
+        列表 / 元组。返回形状为 ``(B, 3, 3)`` 的 ``torch.Tensor``，每一行为
+        camera-control 相机系下的 front / left / up 单位方向。
+        """
         if not self._ensureValid():
             return None
 
-        ref_image_rgb = toRGBUint8(image)
-        return self._runInference(ref_image_rgb)
+        image_list = _asList(image)
+        ref_rgb_list = [toRGBUint8(img) for img in image_list]
+        result = self._runInferenceBatch(ref_rgb_list)
+
+        axes_cam = axes_camera_from_ref_angles(
+            result['src_azi'], result['src_ele'], result['src_rot'],
+        )  # (B, 3, 3) cols=dirs
+        return self._rowsDirsFromCols(axes_cam)
 
     @torch.no_grad()
     def detectFile(
         self,
-        image_file_path: str,
-    ) -> Union[Dict[str, float], None]:
-        if not os.path.exists(image_file_path):
-            print('[ERROR][Detector::detectFile]')
-            print('\t image file not exist!')
-            print('\t image_file_path:', image_file_path)
-            return None
-
+        image_file_path: Union[str, List[str], Tuple[str, ...]],
+    ) -> Union[torch.Tensor, None]:
+        """批量从文件路径读取图像并推理，语义同 ``detect`` 一致。"""
         if not self._ensureValid():
             return None
 
-        ref_image_rgb = loadImageRGB(image_file_path)
-        return self._runInference(ref_image_rgb)
+        path_list = _asList(image_file_path)
+        for path in path_list:
+            if not os.path.exists(path):
+                print('[ERROR][Detector::detectFile]')
+                print('\t image file not exist!')
+                print('\t image_file_path:', path)
+                return None
+
+        ref_rgb_list = [loadImageRGB(p) for p in path_list]
+        result = self._runInferenceBatch(ref_rgb_list)
+
+        axes_cam = axes_camera_from_ref_angles(
+            result['src_azi'], result['src_ele'], result['src_rot'],
+        )
+        return self._rowsDirsFromCols(axes_cam)
 
     @torch.no_grad()
     def detectPair(
         self,
         ref_image: Any,
         tgt_image: Any,
-    ) -> Union[Dict[str, float], None]:
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[None, None]]:
+        """成对推理，返回 ``(src_axes, tgt_axes)``，两者均为 ``(B, 3, 3)``
+        的 camera-control 相机系语义轴 (行 = front/left/up)。"""
         if not self._ensureValid():
-            return None
+            return None, None
 
-        ref_rgb = toRGBUint8(ref_image)
-        tgt_rgb = toRGBUint8(tgt_image)
-        return self._runInference(ref_rgb, tgt_rgb)
+        ref_list = _asList(ref_image)
+        tgt_list = _asList(tgt_image)
+        if len(ref_list) != len(tgt_list):
+            print('[ERROR][Detector::detectPair]')
+            print(
+                f'\t ref / tgt batch size mismatch: {len(ref_list)} vs {len(tgt_list)}'
+            )
+            return None, None
+
+        ref_rgb_list = [toRGBUint8(img) for img in ref_list]
+        tgt_rgb_list = [toRGBUint8(img) for img in tgt_list]
+        result = self._runInferenceBatch(ref_rgb_list, tgt_rgb_list)
+
+        src_axes = axes_camera_from_ref_angles(
+            result['src_azi'], result['src_ele'], result['src_rot'],
+        )
+        tgt_axes = axes_camera_from_ref_angles(
+            result['tgt_azi'], result['tgt_ele'], result['tgt_rot'],
+        )
+        return (
+            self._rowsDirsFromCols(src_axes),
+            self._rowsDirsFromCols(tgt_axes),
+        )
 
     @torch.no_grad()
     def detectPairFiles(
         self,
-        ref_image_file_path: str,
-        tgt_image_file_path: str,
-    ) -> Union[Dict[str, float], None]:
-        if not os.path.exists(ref_image_file_path):
-            print('[ERROR][Detector::detectPairFiles]')
-            print('\t ref image file not exist!')
-            print('\t ref_image_file_path:', ref_image_file_path)
-            return None
-
-        if not os.path.exists(tgt_image_file_path):
-            print('[ERROR][Detector::detectPairFiles]')
-            print('\t tgt image file not exist!')
-            print('\t tgt_image_file_path:', tgt_image_file_path)
-            return None
-
-        if not self._ensureValid():
-            return None
-
-        ref_rgb = loadImageRGB(ref_image_file_path)
-        tgt_rgb = loadImageRGB(tgt_image_file_path)
-        return self._runInference(ref_rgb, tgt_rgb)
-
-    @torch.no_grad()
-    def detectAxisWorld(
-        self,
-        camera: Camera,
-        use_mask: bool = True,
-        mask_smaller_pixel_num: int = 0,
-    ) -> Union[torch.Tensor, None]:
-        if not self._ensureValid():
-            return None
-
-        image = camera.toImage(
-            use_mask=use_mask,
-            mask_smaller_pixel_num=mask_smaller_pixel_num,
-        )
-
-        ref_image_rgb = toRGBUint8(image)
-        result = self._runInference(ref_image_rgb)
-
-        axis_world = axes_world_from_ref_angles(
-            result['src_azi'],
-            result['src_ele'],
-            result['src_rot'],
-            camera,
-        )
-
-        return axis_world.T
-
-    @torch.no_grad()
-    def detectAxisPairWorld(
-        self,
-        src_camera: Camera,
-        tgt_camera: Camera,
-        use_mask: bool = True,
-        mask_smaller_pixel_num: int = 0,
+        ref_image_file_path: Union[str, List[str], Tuple[str, ...]],
+        tgt_image_file_path: Union[str, List[str], Tuple[str, ...]],
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[None, None]]:
         if not self._ensureValid():
             return None, None
 
-        src_image = src_camera.toImage(
-            use_mask=use_mask,
-            mask_smaller_pixel_num=mask_smaller_pixel_num,
+        ref_paths = _asList(ref_image_file_path)
+        tgt_paths = _asList(tgt_image_file_path)
+        if len(ref_paths) != len(tgt_paths):
+            print('[ERROR][Detector::detectPairFiles]')
+            print(
+                f'\t ref / tgt batch size mismatch: {len(ref_paths)} vs {len(tgt_paths)}'
+            )
+            return None, None
+
+        for p in ref_paths:
+            if not os.path.exists(p):
+                print('[ERROR][Detector::detectPairFiles]')
+                print('\t ref image file not exist!')
+                print('\t ref_image_file_path:', p)
+                return None, None
+        for p in tgt_paths:
+            if not os.path.exists(p):
+                print('[ERROR][Detector::detectPairFiles]')
+                print('\t tgt image file not exist!')
+                print('\t tgt_image_file_path:', p)
+                return None, None
+
+        ref_rgb_list = [loadImageRGB(p) for p in ref_paths]
+        tgt_rgb_list = [loadImageRGB(p) for p in tgt_paths]
+        result = self._runInferenceBatch(ref_rgb_list, tgt_rgb_list)
+
+        src_axes = axes_camera_from_ref_angles(
+            result['src_azi'], result['src_ele'], result['src_rot'],
         )
-        tgt_image = tgt_camera.toImage(
-            use_mask=use_mask,
-            mask_smaller_pixel_num=mask_smaller_pixel_num,
+        tgt_axes = axes_camera_from_ref_angles(
+            result['tgt_azi'], result['tgt_ele'], result['tgt_rot'],
+        )
+        return (
+            self._rowsDirsFromCols(src_axes),
+            self._rowsDirsFromCols(tgt_axes),
         )
 
-        src_rgb = toRGBUint8(src_image)
-        tgt_rgb = toRGBUint8(tgt_image)
-        result = self._runInference(src_rgb, tgt_rgb)
+    @torch.no_grad()
+    def detectAxisWorld(
+        self,
+        camera: Union[Camera, List[Camera], Tuple[Camera, ...]],
+        use_mask: bool = True,
+        mask_smaller_pixel_num: int = 0,
+    ) -> Union[torch.Tensor, None]:
+        """批量推理世界坐标系下的语义轴矩阵。
 
-        src_axis_world = axes_world_from_ref_angles(
-            result['src_azi'],
-            result['src_ele'],
-            result['src_rot'],
-            src_camera,
-        )
-        tgt_axis_world = axes_world_from_ref_angles(
-            result['tgt_azi'],
-            result['tgt_ele'],
-            result['tgt_rot'],
-            tgt_camera,
-        )
+        ``camera`` 可以是单个 ``Camera`` 或同构列表；返回 ``(B, 3, 3)``，每
+        一行为世界系下的 front / left / up 单位方向。
+        """
+        if not self._ensureValid():
+            return None
 
-        return src_axis_world.T, tgt_axis_world.T
+        camera_list = _asList(camera)
+        ref_rgb_list = [
+            toRGBUint8(
+                cam.toImage(
+                    use_mask=use_mask,
+                    mask_smaller_pixel_num=mask_smaller_pixel_num,
+                )
+            )
+            for cam in camera_list
+        ]
+        result = self._runInferenceBatch(ref_rgb_list)
+
+        axes_world = axes_world_from_ref_angles(
+            result['src_azi'], result['src_ele'], result['src_rot'],
+            camera_list,
+        )  # (B, 3, 3) cols=dirs
+        return self._rowsDirsFromCols(axes_world)
+
+    @torch.no_grad()
+    def detectAxisPairWorld(
+        self,
+        src_camera: Union[Camera, List[Camera], Tuple[Camera, ...]],
+        tgt_camera: Union[Camera, List[Camera], Tuple[Camera, ...]],
+        use_mask: bool = True,
+        mask_smaller_pixel_num: int = 0,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[None, None]]:
+        """成对相机推理，返回 ``(src_axes_world, tgt_axes_world)``，两者形状
+        均为 ``(B, 3, 3)`` (行 = front/left/up, 世界系)。"""
+        if not self._ensureValid():
+            return None, None
+
+        src_list = _asList(src_camera)
+        tgt_list = _asList(tgt_camera)
+        if len(src_list) != len(tgt_list):
+            print('[ERROR][Detector::detectAxisPairWorld]')
+            print(
+                f'\t src / tgt camera list length mismatch: '
+                f'{len(src_list)} vs {len(tgt_list)}'
+            )
+            return None, None
+
+        src_rgb_list = [
+            toRGBUint8(
+                cam.toImage(
+                    use_mask=use_mask,
+                    mask_smaller_pixel_num=mask_smaller_pixel_num,
+                )
+            )
+            for cam in src_list
+        ]
+        tgt_rgb_list = [
+            toRGBUint8(
+                cam.toImage(
+                    use_mask=use_mask,
+                    mask_smaller_pixel_num=mask_smaller_pixel_num,
+                )
+            )
+            for cam in tgt_list
+        ]
+        result = self._runInferenceBatch(src_rgb_list, tgt_rgb_list)
+
+        src_axes_world = axes_world_from_ref_angles(
+            result['src_azi'], result['src_ele'], result['src_rot'],
+            src_list,
+        )
+        tgt_axes_world = axes_world_from_ref_angles(
+            result['tgt_azi'], result['tgt_ele'], result['tgt_rot'],
+            tgt_list,
+        )
+        return (
+            self._rowsDirsFromCols(src_axes_world),
+            self._rowsDirsFromCols(tgt_axes_world),
+        )
 
     @torch.no_grad()
     def detectBestAxisWorld(
         self,
         camera_list: List[Camera],
-        camera_offset: int=1,
+        camera_offset: int = 1,
+        mini_batch_size: int = 40,
         use_mask: bool = True,
         mask_smaller_pixel_num: int = 0,
     ) -> Union[torch.Tensor, None]:
+        """对一组相机做 (i, i+offset) 配对推理，返回每个 i 对应的源相机世界系
+        语义轴堆栈，形状 ``(N, 3, 3)``。
+
+        说明：真正的「best 聚合」策略仍在开发中，这里先保证返回值与其它
+        detect* 接口的 batch 语义一致 (每个相机一份 3x3 轴矩阵)。
+        """
         if len(camera_list) == 0:
             print('[WARN][Detector::detectBestAxisWorld]')
             print('\t camera list is empty!')
@@ -302,32 +439,38 @@ class Detector(object):
                 mask_smaller_pixel_num=mask_smaller_pixel_num,
             )
 
-        src_axis_world_list = []
-        tgt_axis_world_list = []
+        N = len(camera_list)
+        src_cam_list: List[Camera] = [
+            camera_list[i] for i in range(N)
+        ]
+        tgt_cam_list: List[Camera] = [
+            camera_list[(i + camera_offset) % N] for i in range(N)
+        ]
 
         print('[INFO][Detector::detectBestAxisWorld]')
         print('\t start detect object axis pairs...')
-        for i in trange(len(camera_list)):
-            src_camera = camera_list[i]
-            tgt_camera = camera_list[(i + camera_offset) % len(camera_list)]
-
-            src_axis_world, tgt_axis_world = self.detectAxisPairWorld(
-                src_camera=src_camera,
-                tgt_camera=tgt_camera,
+        if mini_batch_size is None or mini_batch_size <= 0 or mini_batch_size >= N:
+            src_axes_world, _ = self.detectAxisPairWorld(
+                src_camera=src_cam_list,
+                tgt_camera=tgt_cam_list,
                 use_mask=use_mask,
                 mask_smaller_pixel_num=mask_smaller_pixel_num,
             )
+            return src_axes_world
 
-            if src_axis_world is None or tgt_axis_world is None:
-                print('[WARN][Detector::detectBestAxisWorld]')
-                print('\t detectAxisPairWorld failed!')
-                continue
+        num_chunks = (N + mini_batch_size - 1) // mini_batch_size
+        chunk_axes: List[torch.Tensor] = []
+        for chunk_idx in trange(num_chunks):
+            start = chunk_idx * mini_batch_size
+            end = min(start + mini_batch_size, N)
+            chunk_src, _ = self.detectAxisPairWorld(
+                src_camera=src_cam_list[start:end],
+                tgt_camera=tgt_cam_list[start:end],
+                use_mask=use_mask,
+                mask_smaller_pixel_num=mask_smaller_pixel_num,
+            )
+            if chunk_src is None:
+                return None
+            chunk_axes.append(chunk_src)
 
-            src_axis_world_list.append(src_axis_world)
-            tgt_axis_world_list.append(tgt_axis_world)
-
-        print(len(src_axis_world_list))
-        print(len(tgt_axis_world_list))
-        print(src_axis_world_list[0].shape)
-
-        return src_axis_world_list[0]
+        return torch.cat(chunk_axes, dim=0)

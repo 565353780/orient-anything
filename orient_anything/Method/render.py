@@ -1,14 +1,14 @@
 """基于 cv2 的语义轴叠加渲染工具（不依赖 PIL）。"""
 
+from typing import Union
+
 import cv2
 import numpy as np
+import torch
 
 from camera_control.Module.camera import Camera
 
-from orient_anything.Method.axis import (
-    assertRightHandedAxes,
-    computeObjectAxesInWorld,
-)
+from orient_anything.Method.axis import assertRightHandedAxes
 from orient_anything.Method.image import saveImageRGB, toRGBUint8
 from orient_anything.Method.projection import projectWorldPointsToPixel
 
@@ -24,9 +24,43 @@ def _toIntPoint(pt):
     return (int(round(pt[0])), int(round(pt[1])))
 
 
+def _toAxisWorld3x3Numpy(
+    axis_world: Union[torch.Tensor, np.ndarray],
+) -> np.ndarray:
+    """把用户传入的 world 系轴矩阵规范化为 ``(3, 3)`` cols=dirs numpy 数组。
+
+    接受形状：
+        - ``(3, 3)``: 解释为 **rows=dirs** (对齐 Detector / createAxisMesh 的公共约定)；
+        - ``(1, 3, 3)`` / ``(B, 3, 3)``: batch 输入，取第 0 个样本 (rows=dirs)。
+
+    内部 ``drawAxesOnImage`` 仍按 cols=dirs 使用 (``axis_world[:, i]``)，
+    故这里最后做一次转置。
+    """
+    if isinstance(axis_world, torch.Tensor):
+        arr = axis_world.detach().cpu().numpy()
+    else:
+        arr = np.asarray(axis_world)
+    arr = np.asarray(arr, dtype=np.float64)
+
+    if arr.ndim == 3:
+        if arr.shape[-2:] != (3, 3):
+            raise ValueError(
+                f'[render] axis_world batch has invalid shape {arr.shape}; '
+                f'expected (B, 3, 3)'
+            )
+        arr = arr[0]
+    elif arr.ndim != 2 or arr.shape != (3, 3):
+        raise ValueError(
+            f'[render] axis_world has invalid shape {arr.shape}; '
+            f'expected (3, 3) or (B, 3, 3)'
+        )
+    # 入参是 rows=dirs，内部用 cols=dirs，故转置。
+    return arr.T
+
+
 def drawAxesOnImage(
     src_image,
-    result: dict,
+    axis_world: Union[torch.Tensor, np.ndarray],
     camera: Camera,
     save_image_file_path: str,
     axis_screen_ratio: float = 0.3,
@@ -34,9 +68,12 @@ def drawAxesOnImage(
 ) -> None:
     """在图像上叠加三根彩色坐标轴 (front/left/up => 红/绿/蓝)，纯 cv2 实现。
 
+    ``axis_world`` 必须是 **世界坐标系** 下的三根单位方向，形状可为
+    ``(3, 3)`` 或 ``(B, 3, 3)`` (batch 时取第 0 个样本)，行依次为
+    front / left / up，与 ``Detector.detectAxisWorld`` 的返回约定一致。
+
     流程（严格走「世界系方向 → 世界系起终点 → uv → 图像像素」的链路）：
-        1. 由 (azi, ele, rot) 经 ``computeObjectAxesInWorld`` 得到 **世界坐标系**
-           下 front/left/up 三列单位方向；
+        1. 使用入参的世界系 front/left/up 三根单位方向；
         2. 以 ``camera.projectUV2Points(uv=[0.5, 0.5], depth=1.0)`` 反投影得到的
            世界点为三根轴共同起点，沿每根方向延长统一的 3D 长度 ``L`` 得到三个
            世界系终点（即终点随起点整体平移，方向与长度不变）；
@@ -52,8 +89,8 @@ def drawAxesOnImage(
     H, W = canvas.shape[:2]
     short_side = float(min(W, H))
 
-    axis_world = computeObjectAxesInWorld(result, camera)
-    assertRightHandedAxes(axis_world)
+    axis_world_cols = _toAxisWorld3x3Numpy(axis_world)
+    assertRightHandedAxes(axis_world_cols)
 
     # 将三根轴的起点挪到图像中心 (uv=[0.5, 0.5]) 处、相机前方 depth=1.0 的世界点，
     # 终点随起点一起平移（方向与长度不变）。
@@ -73,7 +110,7 @@ def drawAxesOnImage(
 
     world_points = [origin_world]
     for i in range(3):
-        direction = axis_world[:, i].astype(np.float64)
+        direction = axis_world_cols[:, i].astype(np.float64)
         world_points.append(origin_world + direction * axis_length_3d)
 
     pixel_points = projectWorldPointsToPixel(

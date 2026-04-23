@@ -13,11 +13,16 @@ Detector 网络直接输出 (azi, ele, rot) 三元角度，``azi_ele_rot_to_sema
 两者相差一个固定的行置换 ``P``，本模块集中负责这层换算，调用方只会看到
 已经处于 camera-control 相机系 / 世界系下的轴，不需要再手写任何
 ``camera.R`` / ``camera.camera2world`` 之类的矩阵乘法。
+
+所有对外函数都以 **batch 语义** 为主：
+    ``axes_camera_from_ref_angles`` / ``axes_world_from_ref_angles`` 接受
+    标量或形状 (B,) 的 ``azi/ele/rot`` 角度，返回 (B, 3, 3) 的张量，列依次
+    为 front / left / up；若传入标量则返回 (1, 3, 3)。
 """
 
 import os
 import sys
-from typing import Union
+from typing import List, Union
 
 import numpy as np
 import torch
@@ -46,6 +51,18 @@ _DETECTOR_TO_CAMERA_AXIS_PERM = torch.tensor(
 )
 
 
+def _asAngleTensor(value: Union[float, int, torch.Tensor, np.ndarray]) -> torch.Tensor:
+    """把单个角度 / (B,) 角度统一成一维 ``torch.Tensor``。"""
+    tensor = torch.as_tensor(value, dtype=torch.float32)
+    if tensor.ndim == 0:
+        tensor = tensor.unsqueeze(0)
+    elif tensor.ndim != 1:
+        raise ValueError(
+            f'[axis] expect scalar or 1D angle tensor, got shape {tuple(tensor.shape)}'
+        )
+    return tensor
+
+
 def axes_camera_from_ref_angles(
     azi: Union[float, torch.Tensor],
     ele: Union[float, torch.Tensor],
@@ -53,19 +70,20 @@ def axes_camera_from_ref_angles(
 ) -> torch.Tensor:
     """由 (azi, ele, rot)（度）恢复 **camera-control 相机坐标系** 下的语义轴。
 
-    返回形状 (3, 3)，三列依次为 front / left / up 三根语义轴的单位方向，
-    分量采用 camera-control 的 ``X=右, Y=上, Z=后`` 约定。
+    输入可以是标量或形状 (B,) 的角度张量；输出统一为 (B, 3, 3) 的张量，
+    三列依次为 front / left / up 三根语义轴的单位方向，分量采用
+    camera-control 的 ``X=右, Y=上, Z=后`` 约定。
 
     实现上只做两件事：
         1. 调 ``azi_ele_rot_to_semantic_axes`` 取得「原始」(X=后, Y=右, Z=上)
-           坐标系下的 3x3 矩阵；
-        2. 左乘固定行置换 ``_DETECTOR_TO_CAMERA_AXIS_PERM``。
+           坐标系下的 (B, 3, 3) 矩阵；
+        2. 左乘固定行置换 ``_DETECTOR_TO_CAMERA_AXIS_PERM`` (对 B 自动广播)。
     """
-    axes_raw = azi_ele_rot_to_semantic_axes(
-        torch.as_tensor(azi, dtype=torch.float32),
-        torch.as_tensor(ele, dtype=torch.float32),
-        torch.as_tensor(rot, dtype=torch.float32),
-    )[0]
+    azi_t = _asAngleTensor(azi)
+    ele_t = _asAngleTensor(ele)
+    rot_t = _asAngleTensor(rot)
+
+    axes_raw = azi_ele_rot_to_semantic_axes(azi_t, ele_t, rot_t)  # (B, 3, 3)
     perm = _DETECTOR_TO_CAMERA_AXIS_PERM.to(
         dtype=axes_raw.dtype, device=axes_raw.device
     )
@@ -76,7 +94,7 @@ def axes_world_from_ref_angles(
     azi: Union[float, torch.Tensor],
     ele: Union[float, torch.Tensor],
     rot: Union[float, torch.Tensor],
-    camera: Camera,
+    camera: Union[Camera, List[Camera]],
 ) -> torch.Tensor:
     """由 (azi, ele, rot)（度）恢复 **世界坐标系** 下的 front/left/up 三列。
 
@@ -84,31 +102,43 @@ def axes_world_from_ref_angles(
         angles --reorder--> axis_cam (camera-control 相机系, 列=方向)
                --camera.toDirectionsWorld--> axis_world (列=方向)
 
-    注意 ``Camera.toDirectionsWorld`` 按「行 = 方向向量」约定接受输入；这里
-    通过 ``.T`` 做一次形状适配，以便整条链路只依赖 Camera 内部的转换函数。
-    """
-    axes_cam = axes_camera_from_ref_angles(azi, ele, rot)
+    支持两种调用方式：
+        - ``camera`` 为单个 ``Camera``：所有 batch 样本共享同一相机；
+        - ``camera`` 为长度 B 的 ``Camera`` 列表：每个样本走自己的相机。
 
-    axes_world_rows = camera.toDirectionsWorld(axes_cam.T)
-    axes_world = axes_world_rows.T
+    返回形状 (B, 3, 3)，列依次为 world 系下的 front / left / up 单位方向。
+    """
+    axes_cam = axes_camera_from_ref_angles(azi, ele, rot)  # (B, 3, 3) cols=dirs
+    B = axes_cam.shape[0]
+
+    if isinstance(camera, (list, tuple)):
+        camera_list = list(camera)
+        if len(camera_list) != B:
+            raise ValueError(
+                f'[axis] camera list length {len(camera_list)} != batch size {B}'
+            )
+        R_stack = torch.stack(
+            [
+                cam.world2camera[:3, :3].to(
+                    dtype=axes_cam.dtype, device=axes_cam.device
+                )
+                for cam in camera_list
+            ],
+            dim=0,
+        )
+    else:
+        R_single = camera.world2camera[:3, :3].to(
+            dtype=axes_cam.dtype, device=axes_cam.device
+        )
+        R_stack = R_single.unsqueeze(0).expand(B, -1, -1)
+
+    # 先把 axes_cam 转成 rows=dirs (对应 Camera.toDirectionsWorld 的行约定)，
+    # 做一次批量 matmul 再转回 cols=dirs。
+    axes_cam_rows = axes_cam.transpose(-1, -2)  # (B, 3, 3) rows=dirs
+    axes_world_rows = axes_cam_rows @ R_stack  # (B, 3, 3) rows=dirs (world)
+    axes_world = axes_world_rows.transpose(-1, -2)  # (B, 3, 3) cols=dirs
 
     return axes_world.to(dtype=axes_cam.dtype, device=axes_cam.device)
-
-
-def computeObjectAxesInWorld(result: dict, camera: Camera) -> np.ndarray:
-    """由 detector 输出 ``result`` 计算物体三根语义轴在 **世界系** 下的方向。
-
-    返回形状 (3, 3) 的 ``numpy.ndarray``，列依次为 front / left / up 三根
-    单位方向 (对应 R/G/B)。下游可以直接把这些方向与世界原点组合成 3D 线段，
-    再交给 ``camera.project_points_to_uv`` 投影到图像平面。
-    """
-    axis_world = axes_world_from_ref_angles(
-        float(result['src_azi']),
-        float(result['src_ele']),
-        float(result['src_rot']),
-        camera,
-    ).detach().cpu()
-    return axis_world.numpy()
 
 
 def assertRightHandedAxes(axis_3x3: np.ndarray, tol: float = 1e-3) -> None:
