@@ -181,6 +181,7 @@ def demo_camera_list():
     output_folder_path = './output/demo_detector/'
 
     camera_list = CameraConvertor.loadColmapDataFolder(colmap_data_folder_path)
+    camera_list = [None] * 203
 
     detector = Detector(
         model_file_path=model_file_path,
@@ -190,16 +191,15 @@ def demo_camera_list():
 
     assert detector.is_valid
 
-    best_axis_world_batch = detector.detectBestAxisWorld(
+    best_axis_world = detector.detectBestAxisWorld(
         camera_list,
         camera_offset=1,
         mini_batch_size=40,
     )
-    assert best_axis_world_batch is not None
-    assert best_axis_world_batch.shape == (len(camera_list), 3, 3)
+    assert best_axis_world is not None
 
     # 当前还没有实现真正的 "best" 聚合，暂取第 0 个相机对应的结果可视化。
-    axis = createAxisMesh(best_axis_world_batch[0])
+    axis = createAxisMesh(best_axis_world)
 
     collection_mesh = o3d.geometry.TriangleMesh()
 

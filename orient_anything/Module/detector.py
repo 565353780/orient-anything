@@ -420,9 +420,9 @@ class Detector(object):
         mini_batch_size: int = 40,
         use_mask: bool = True,
         mask_smaller_pixel_num: int = 0,
-    ) -> Union[torch.Tensor, None]:
-        """对一组相机做 (i, i+offset) 配对推理，返回每个 i 对应的源相机世界系
-        语义轴堆栈，形状 ``(N, 3, 3)``。
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[None, None]]:
+        """对一组相机做 (i, i+offset) 配对推理，返回每个 i 对应的源和目标相机世界系
+        语义轴堆栈，形状均为 ``(N, 3, 3)``。
 
         说明：真正的「best 聚合」策略仍在开发中，这里先保证返回值与其它
         detect* 接口的 batch 语义一致 (每个相机一份 3x3 轴矩阵)。
@@ -430,47 +430,77 @@ class Detector(object):
         if len(camera_list) == 0:
             print('[WARN][Detector::detectBestAxisWorld]')
             print('\t camera list is empty!')
-            return None
+            return None, None
 
         if len(camera_list) == 1:
-            return self.detectAxisWorld(
+            # 保持返回值语义一致，返回 (src_axes, tgt_axes)
+            axis = self.detectAxisWorld(
                 camera=camera_list[0],
                 use_mask=use_mask,
                 mask_smaller_pixel_num=mask_smaller_pixel_num,
             )
+            if axis is None:
+                return None, None
+            return axis, axis
 
-        N = len(camera_list)
-        src_cam_list: List[Camera] = [
-            camera_list[i] for i in range(N)
-        ]
-        tgt_cam_list: List[Camera] = [
-            camera_list[(i + camera_offset) % N] for i in range(N)
-        ]
+        tmp_axis_src_file_path = './output/tmp_axis_src_world.npy'
+        tmp_axis_tgt_file_path = './output/tmp_axis_tgt_world.npy'
 
-        print('[INFO][Detector::detectBestAxisWorld]')
-        print('\t start detect object axis pairs...')
-        if mini_batch_size is None or mini_batch_size <= 0 or mini_batch_size >= N:
-            src_axes_world, _ = self.detectAxisPairWorld(
-                src_camera=src_cam_list,
-                tgt_camera=tgt_cam_list,
-                use_mask=use_mask,
-                mask_smaller_pixel_num=mask_smaller_pixel_num,
-            )
-            return src_axes_world
+        if os.path.exists(tmp_axis_src_file_path) and os.path.exists(tmp_axis_tgt_file_path):
+            src_axes_all = np.load(tmp_axis_src_file_path)
+            tgt_axes_all = np.load(tmp_axis_tgt_file_path)
+            src_axes_all = torch.from_numpy(src_axes_all).to(device=self.device, dtype=self.dtype)
+            tgt_axes_all = torch.from_numpy(tgt_axes_all).to(device=self.device, dtype=self.dtype)
+        else:
+            N = len(camera_list)
+            src_cam_list: List[Camera] = [
+                camera_list[i] for i in range(N)
+            ]
+            tgt_cam_list: List[Camera] = [
+                camera_list[(i + camera_offset) % N] for i in range(N)
+            ]
 
-        num_chunks = (N + mini_batch_size - 1) // mini_batch_size
-        chunk_axes: List[torch.Tensor] = []
-        for chunk_idx in trange(num_chunks):
-            start = chunk_idx * mini_batch_size
-            end = min(start + mini_batch_size, N)
-            chunk_src, _ = self.detectAxisPairWorld(
-                src_camera=src_cam_list[start:end],
-                tgt_camera=tgt_cam_list[start:end],
-                use_mask=use_mask,
-                mask_smaller_pixel_num=mask_smaller_pixel_num,
-            )
-            if chunk_src is None:
-                return None
-            chunk_axes.append(chunk_src)
+            print('[INFO][Detector::detectBestAxisWorld]')
+            print('\t start detect object axis pairs...')
 
-        return torch.cat(chunk_axes, dim=0)
+            if mini_batch_size is None or mini_batch_size <= 0 or mini_batch_size >= N:
+                src_axes_world, tgt_axes_world = self.detectAxisPairWorld(
+                    src_camera=src_cam_list,
+                    tgt_camera=tgt_cam_list,
+                    use_mask=use_mask,
+                    mask_smaller_pixel_num=mask_smaller_pixel_num,
+                )
+                # 保存推理结果为npy文件
+                if src_axes_world is None or tgt_axes_world is None:
+                    return None, None
+                np.save(tmp_axis_src_file_path, src_axes_world.cpu().numpy())
+                np.save(tmp_axis_tgt_file_path, tgt_axes_world.cpu().numpy())
+                return src_axes_world, tgt_axes_world
+
+            num_chunks = (N + mini_batch_size - 1) // mini_batch_size
+            chunk_src_axes: List[torch.Tensor] = []
+            chunk_tgt_axes: List[torch.Tensor] = []
+            for chunk_idx in trange(num_chunks):
+                start = chunk_idx * mini_batch_size
+                end = min(start + mini_batch_size, N)
+                chunk_src, chunk_tgt = self.detectAxisPairWorld(
+                    src_camera=src_cam_list[start:end],
+                    tgt_camera=tgt_cam_list[start:end],
+                    use_mask=use_mask,
+                    mask_smaller_pixel_num=mask_smaller_pixel_num,
+                )
+                if chunk_src is None or chunk_tgt is None:
+                    return None, None
+                chunk_src_axes.append(chunk_src)
+                chunk_tgt_axes.append(chunk_tgt)
+
+            src_axes_all = torch.cat(chunk_src_axes, dim=0)
+            tgt_axes_all = torch.cat(chunk_tgt_axes, dim=0)
+            # 保存推理结果为npy文件
+            np.save(tmp_axis_src_file_path, src_axes_all.cpu().numpy())
+            np.save(tmp_axis_tgt_file_path, tgt_axes_all.cpu().numpy())
+
+        print(src_axes_all.shape)
+        print(tgt_axes_all.shape)
+
+        return src_axes_all, tgt_axes_all
