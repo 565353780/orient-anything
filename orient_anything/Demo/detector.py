@@ -181,7 +181,6 @@ def demo_camera_list():
     output_folder_path = './output/demo_detector/'
 
     camera_list = CameraConvertor.loadColmapDataFolder(colmap_data_folder_path)
-    camera_list = [None] * 203
 
     detector = Detector(
         model_file_path=model_file_path,

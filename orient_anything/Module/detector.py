@@ -1,4 +1,5 @@
 import os
+from orient_anything.Method.axis_fusion import fuseAxisWorld
 import torch
 import numpy as np
 
@@ -194,23 +195,66 @@ class Detector(object):
         """把 ``(B, 3, 3)`` 的 cols=dirs 矩阵转成 rows=dirs (对外公共约定)。"""
         return axes_cols.transpose(-1, -2).contiguous()
 
+    def _runInferenceBatchChunked(
+        self,
+        ref_images_rgb: List[np.ndarray],
+        tgt_images_rgb: Optional[List[np.ndarray]] = None,
+        mini_batch_size: Optional[int] = None,
+    ) -> dict:
+        """对 ``_runInferenceBatch`` 的分块包装。
+
+        - 当 ``mini_batch_size`` 为 ``None`` / ``<= 0`` / ``>= N`` 时直接一次前向；
+        - 否则按 ``mini_batch_size`` 切片分批前向，并在 batch 维拼接每个键的张量。
+        返回的 dict 形状、dtype、device 语义与 ``_runInferenceBatch`` 完全一致。
+        """
+        N = len(ref_images_rgb)
+        if (
+            mini_batch_size is None
+            or mini_batch_size <= 0
+            or mini_batch_size >= N
+        ):
+            return self._runInferenceBatch(ref_images_rgb, tgt_images_rgb)
+
+        num_chunks = (N + mini_batch_size - 1) // mini_batch_size
+        merged: dict = {}
+        for chunk_idx in trange(num_chunks):
+            start = chunk_idx * mini_batch_size
+            end = min(start + mini_batch_size, N)
+            ref_chunk = ref_images_rgb[start:end]
+            tgt_chunk = (
+                tgt_images_rgb[start:end]
+                if tgt_images_rgb is not None
+                else None
+            )
+            chunk_result = self._runInferenceBatch(ref_chunk, tgt_chunk)
+            for key, value in chunk_result.items():
+                merged.setdefault(key, []).append(value)
+
+        return {key: torch.cat(values, dim=0) for key, values in merged.items()}
+
     @torch.no_grad()
     def detect(
         self,
         image: Any,
+        mini_batch_size: Optional[int] = None,
     ) -> Union[torch.Tensor, None]:
         """批量推理相机坐标系下的语义轴矩阵。
 
         ``image`` 可以是单张图片 (``np.ndarray`` / ``torch.Tensor``) 或同构的
         列表 / 元组。返回形状为 ``(B, 3, 3)`` 的 ``torch.Tensor``，每一行为
         camera-control 相机系下的 front / left / up 单位方向。
+
+        ``mini_batch_size`` 为正整数时，按该大小对输入分块调用模型，避免一次
+        前向显存占用过大；为 ``None`` / ``<=0`` / ``>= B`` 时退化为一次前向。
         """
         if not self._ensureValid():
             return None
 
         image_list = _asList(image)
         ref_rgb_list = [toRGBUint8(img) for img in image_list]
-        result = self._runInferenceBatch(ref_rgb_list)
+        result = self._runInferenceBatchChunked(
+            ref_rgb_list, mini_batch_size=mini_batch_size,
+        )
 
         axes_cam = axes_camera_from_ref_angles(
             result['src_azi'], result['src_ele'], result['src_rot'],
@@ -221,6 +265,7 @@ class Detector(object):
     def detectFile(
         self,
         image_file_path: Union[str, List[str], Tuple[str, ...]],
+        mini_batch_size: Optional[int] = None,
     ) -> Union[torch.Tensor, None]:
         """批量从文件路径读取图像并推理，语义同 ``detect`` 一致。"""
         if not self._ensureValid():
@@ -235,7 +280,9 @@ class Detector(object):
                 return None
 
         ref_rgb_list = [loadImageRGB(p) for p in path_list]
-        result = self._runInferenceBatch(ref_rgb_list)
+        result = self._runInferenceBatchChunked(
+            ref_rgb_list, mini_batch_size=mini_batch_size,
+        )
 
         axes_cam = axes_camera_from_ref_angles(
             result['src_azi'], result['src_ele'], result['src_rot'],
@@ -247,6 +294,7 @@ class Detector(object):
         self,
         ref_image: Any,
         tgt_image: Any,
+        mini_batch_size: Optional[int] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[None, None]]:
         """成对推理，返回 ``(src_axes, tgt_axes)``，两者均为 ``(B, 3, 3)``
         的 camera-control 相机系语义轴 (行 = front/left/up)。"""
@@ -264,7 +312,9 @@ class Detector(object):
 
         ref_rgb_list = [toRGBUint8(img) for img in ref_list]
         tgt_rgb_list = [toRGBUint8(img) for img in tgt_list]
-        result = self._runInferenceBatch(ref_rgb_list, tgt_rgb_list)
+        result = self._runInferenceBatchChunked(
+            ref_rgb_list, tgt_rgb_list, mini_batch_size=mini_batch_size,
+        )
 
         src_axes = axes_camera_from_ref_angles(
             result['src_azi'], result['src_ele'], result['src_rot'],
@@ -282,6 +332,7 @@ class Detector(object):
         self,
         ref_image_file_path: Union[str, List[str], Tuple[str, ...]],
         tgt_image_file_path: Union[str, List[str], Tuple[str, ...]],
+        mini_batch_size: Optional[int] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[None, None]]:
         if not self._ensureValid():
             return None, None
@@ -310,7 +361,9 @@ class Detector(object):
 
         ref_rgb_list = [loadImageRGB(p) for p in ref_paths]
         tgt_rgb_list = [loadImageRGB(p) for p in tgt_paths]
-        result = self._runInferenceBatch(ref_rgb_list, tgt_rgb_list)
+        result = self._runInferenceBatchChunked(
+            ref_rgb_list, tgt_rgb_list, mini_batch_size=mini_batch_size,
+        )
 
         src_axes = axes_camera_from_ref_angles(
             result['src_azi'], result['src_ele'], result['src_rot'],
@@ -329,6 +382,7 @@ class Detector(object):
         camera: Union[Camera, List[Camera], Tuple[Camera, ...]],
         use_mask: bool = True,
         mask_smaller_pixel_num: int = 0,
+        mini_batch_size: Optional[int] = None,
     ) -> Union[torch.Tensor, None]:
         """批量推理世界坐标系下的语义轴矩阵。
 
@@ -348,7 +402,9 @@ class Detector(object):
             )
             for cam in camera_list
         ]
-        result = self._runInferenceBatch(ref_rgb_list)
+        result = self._runInferenceBatchChunked(
+            ref_rgb_list, mini_batch_size=mini_batch_size,
+        )
 
         axes_world = axes_world_from_ref_angles(
             result['src_azi'], result['src_ele'], result['src_rot'],
@@ -363,6 +419,7 @@ class Detector(object):
         tgt_camera: Union[Camera, List[Camera], Tuple[Camera, ...]],
         use_mask: bool = True,
         mask_smaller_pixel_num: int = 0,
+        mini_batch_size: Optional[int] = None,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[None, None]]:
         """成对相机推理，返回 ``(src_axes_world, tgt_axes_world)``，两者形状
         均为 ``(B, 3, 3)`` (行 = front/left/up, 世界系)。"""
@@ -397,7 +454,9 @@ class Detector(object):
             )
             for cam in tgt_list
         ]
-        result = self._runInferenceBatch(src_rgb_list, tgt_rgb_list)
+        result = self._runInferenceBatchChunked(
+            src_rgb_list, tgt_rgb_list, mini_batch_size=mini_batch_size,
+        )
 
         src_axes_world = axes_world_from_ref_angles(
             result['src_azi'], result['src_ele'], result['src_rot'],
@@ -462,45 +521,20 @@ class Detector(object):
 
             print('[INFO][Detector::detectBestAxisWorld]')
             print('\t start detect object axis pairs...')
+            src_axes_all, tgt_axes_all = self.detectAxisPairWorld(
+                src_camera=src_cam_list,
+                tgt_camera=tgt_cam_list,
+                use_mask=use_mask,
+                mask_smaller_pixel_num=mask_smaller_pixel_num,
+                mini_batch_size=mini_batch_size,
+            )
+            if src_axes_all is None or tgt_axes_all is None:
+                return None, None
 
-            if mini_batch_size is None or mini_batch_size <= 0 or mini_batch_size >= N:
-                src_axes_world, tgt_axes_world = self.detectAxisPairWorld(
-                    src_camera=src_cam_list,
-                    tgt_camera=tgt_cam_list,
-                    use_mask=use_mask,
-                    mask_smaller_pixel_num=mask_smaller_pixel_num,
-                )
-                # 保存推理结果为npy文件
-                if src_axes_world is None or tgt_axes_world is None:
-                    return None, None
-                np.save(tmp_axis_src_file_path, src_axes_world.cpu().numpy())
-                np.save(tmp_axis_tgt_file_path, tgt_axes_world.cpu().numpy())
-                return src_axes_world, tgt_axes_world
-
-            num_chunks = (N + mini_batch_size - 1) // mini_batch_size
-            chunk_src_axes: List[torch.Tensor] = []
-            chunk_tgt_axes: List[torch.Tensor] = []
-            for chunk_idx in trange(num_chunks):
-                start = chunk_idx * mini_batch_size
-                end = min(start + mini_batch_size, N)
-                chunk_src, chunk_tgt = self.detectAxisPairWorld(
-                    src_camera=src_cam_list[start:end],
-                    tgt_camera=tgt_cam_list[start:end],
-                    use_mask=use_mask,
-                    mask_smaller_pixel_num=mask_smaller_pixel_num,
-                )
-                if chunk_src is None or chunk_tgt is None:
-                    return None, None
-                chunk_src_axes.append(chunk_src)
-                chunk_tgt_axes.append(chunk_tgt)
-
-            src_axes_all = torch.cat(chunk_src_axes, dim=0)
-            tgt_axes_all = torch.cat(chunk_tgt_axes, dim=0)
             # 保存推理结果为npy文件
             np.save(tmp_axis_src_file_path, src_axes_all.cpu().numpy())
             np.save(tmp_axis_tgt_file_path, tgt_axes_all.cpu().numpy())
 
-        print(src_axes_all.shape)
-        print(tgt_axes_all.shape)
+        fuse_axis_world = fuseAxisWorld(src_axes_all, tgt_axes_all)
 
-        return src_axes_all, tgt_axes_all
+        return fuse_axis_world
